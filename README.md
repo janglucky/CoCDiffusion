@@ -19,7 +19,8 @@
 
 
 ### 📢 News
-- **2024.06** Our One-Step Real-ISR work [OSEDiff](https://github.com/cswry/OSEDiff), which achieves SeeSR-level quality but is **over 30 times faster**.
+- **2026.04** Our new paper [VOSR](https://github.com/cswry/VOSR), a vision-only generative model for image super-resolution, has been accepted by **CVPR 2026**.
+- **2024.06** Our One-Step Real-ISR work [OSEDiff](https://github.com/cswry/OSEDiff) has been accepted by **NeurIPS 2024**, achieving SeeSR-level quality while being **over 30 times faster**.
 - **2024.03.10** Support [sd-turbo](https://huggingface.co/stabilityai/sd-turbo), SeeSR can get a not bad image with only **2 steps** ⚡️. Please refer to [it](#Step-sd-turbo).
 - **2024.01.12** 🔥🔥🔥 Integrated to <a href='https://replicate.com/lucataco/seesr'><img src='https://replicate.com/lucataco/seesr/badge'></a> Try out <u>[Replicate](https://replicate.com/lucataco/seesr)</u> online demo ❤️ Thanks [lucataco](https://github.com/lucataco) for the implementation. 
 - **2024.01.09** 🚀 Add Gradio demo, including turbo mode.
@@ -60,7 +61,7 @@ pip install -r requirements.txt
 
 ## 🚀 Quick Inference
 #### Step 1: Download the pretrained models
-- Download the pretrained SD-2-base models from [HuggingFace](https://huggingface.co/stabilityai/stable-diffusion-2-base) or [GoogleDrive](https://drive.google.com/drive/folders/1LVSwWbjJdn5Wxy79AwV5LdPX2S2Hotx1).
+- Download the pretrained SD-2-base models from [HuggingFace](https://huggingface.co/Manojb/stable-diffusion-2-base) or [GoogleDrive](https://drive.google.com/drive/folders/1LVSwWbjJdn5Wxy79AwV5LdPX2S2Hotx1).
 - Download the SeeSR and DAPE models from [GoogleDrive](https://drive.google.com/drive/folders/12HXrRGEXUAnmHRaf0bIn-S8XSK4Ku0JO?usp=drive_link) or [OneDrive](https://connectpolyu-my.sharepoint.com/:f:/g/personal/22042244r_connect_polyu_hk/EiUmSfWRmQFNiTGJWs7rOx0BpZn2xhoKN6tXFmTSGJ4Jfw?e=RdLbvg).
 
 You can put the models into `preset/models`.
@@ -122,7 +123,7 @@ We release our `RealLR200` at [GoogleDrive](https://drive.google.com/drive/folde
 ## 🌈 Train 
 
 #### Step1: Download the pretrained models
-Download the pretrained [SD-2-base models](https://huggingface.co/stabilityai/stable-diffusion-2-base) and [RAM](https://huggingface.co/spaces/xinyu1205/recognize-anything/blob/main/ram_swin_large_14m.pth). You can put them into `preset/models`.
+Download the pretrained [SD-2-base models](https://huggingface.co/Manojb/stable-diffusion-2-base) and [RAM](https://huggingface.co/spaces/xinyu1205/recognize-anything/blob/main/ram_swin_large_14m.pth). You can put them into `preset/models`.
 
 #### Step2: Prepare training data
 We pre-prepare training data pairs for the training process, which would take up some memory space but save training time. We train the DAPE with [COCO](https://cocodataset.org/#home) and train the SeeSR with LSDIR+FFHQ10k.
