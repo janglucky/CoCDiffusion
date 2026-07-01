@@ -1,32 +1,42 @@
-# single gpu
-CUDA_VISIBLE_DEVICES="0," accelerate launch train_seesr.py \
---pretrained_model_name_or_path="preset/models/stable-diffusion-2-base" \
---output_dir="./experience/seesr" \
---root_folders 'preset/datasets/training_datasets' \
---ram_ft_path 'preset/models/DAPE.pth' \
---enable_xformers_memory_efficient_attention \
---mixed_precision="fp16" \
---resolution=512 \
---learning_rate=5e-5 \
---train_batch_size=16 \
---gradient_accumulation_steps=2 \
---null_text_ratio=0.5 
---dataloader_num_workers=0 \
---checkpointing_steps=10000 
+#!/usr/bin/env bash
+set -euo pipefail
 
+set +u
+source /home/gd09385/anaconda3/bin/activate seesr
+set -u
 
-# multi-gpus
-CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7," accelerate launch train_seesr.py \
---pretrained_model_name_or_path="preset/models/stable-diffusion-2-base" \
---output_dir="./experience/seesr" \
---root_folders 'preset/datasets/training_datasets' \
---ram_ft_path 'preset/models/DAPE.pth' \
---enable_xformers_memory_efficient_attention \
---mixed_precision="fp16" \
---resolution=512 \
---learning_rate=5e-5 \
---train_batch_size=2 \
---gradient_accumulation_steps=2 \
---null_text_ratio=0.5 
---dataloader_num_workers=0 \
---checkpointing_steps=10000 
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+
+PRETRAINED_MODEL_PATH="${PRETRAINED_MODEL_PATH:-/home/gd09385/models/stable-diffusion-2-base}"
+SEESR_MODEL_PATH="${SEESR_MODEL_PATH:-/home/gd09385/models/seesr}"
+ROOT_FOLDERS="${ROOT_FOLDERS:-/home/gd09385/data/train_c_sub}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_c_sub}"
+MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
+LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
+MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
+
+cmd=(
+  accelerate launch train_seesr.py
+  --pretrained_model_name_or_path "${PRETRAINED_MODEL_PATH}"
+  --controlnet_model_name_or_path "${SEESR_MODEL_PATH}"
+  --unet_model_name_or_path "${SEESR_MODEL_PATH}"
+  --output_dir "${OUTPUT_DIR}"
+  --root_folders "${ROOT_FOLDERS}"
+  --enable_xformers_memory_efficient_attention
+  --mixed_precision "${MIXED_PRECISION}"
+  --learning_rate "${LEARNING_RATE}"
+  --train_batch_size "${TRAIN_BATCH_SIZE}"
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
+  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
+  --checkpointing_steps "${CHECKPOINTING_STEPS}"
+)
+
+if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
+  cmd+=(--max_train_steps "${MAX_TRAIN_STEPS}")
+fi
+
+"${cmd[@]}" "$@"

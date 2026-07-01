@@ -675,7 +675,11 @@ class UNetMidBlock2DCrossAttn(nn.Module):
         hidden_states = self.resnets[0](hidden_states, temb)
 
         if self.use_image_cross_attention:
-            for attn, image_attn, resnet in zip(self.attentions, self.image_attentions, self.resnets[1:]):
+            for image_attn, resnet in zip(self.image_attentions, self.resnets[1:]):
+                if image_encoder_hidden_states is None:
+                    hidden_states = resnet(hidden_states, temb)
+                    continue
+
                 if self.training and self.gradient_checkpointing:
 
                     def create_custom_forward(module, return_dict=None):
@@ -688,15 +692,6 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                         return custom_forward
 
                     ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
                     hidden_states = image_attn(
                         hidden_states,
                         encoder_hidden_states=image_encoder_hidden_states,
@@ -712,15 +707,6 @@ class UNetMidBlock2DCrossAttn(nn.Module):
                         **ckpt_kwargs,
                     )
                 else:
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
                     hidden_states = image_attn(
                         hidden_states,
                         encoder_hidden_states=image_encoder_hidden_states,
@@ -733,6 +719,10 @@ class UNetMidBlock2DCrossAttn(nn.Module):
 
         else:
             for attn, resnet in zip(self.attentions, self.resnets[1:]):
+                if encoder_hidden_states is None:
+                    hidden_states = resnet(hidden_states, temb)
+                    continue
+
                 if self.training and self.gradient_checkpointing:
 
                     def create_custom_forward(module, return_dict=None):
@@ -1141,8 +1131,8 @@ class CrossAttnDownBlock2D(nn.Module):
 
 
         if self.use_image_cross_attention:
-            blocks = list(zip(self.resnets, self.attentions, self.image_attentions))
-            for i, (resnet, attn, image_attn) in enumerate(blocks):
+            blocks = list(zip(self.resnets, self.image_attentions))
+            for i, (resnet, image_attn) in enumerate(blocks):
                 if self.training and self.gradient_checkpointing:
 
                     def create_custom_forward(module, return_dict=None):
@@ -1161,42 +1151,26 @@ class CrossAttnDownBlock2D(nn.Module):
                         temb,
                         **ckpt_kwargs,
                     )
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
-                    hidden_states = image_attn(
-                        hidden_states,
-                        encoder_hidden_states=image_encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if image_encoder_hidden_states is not None:
+                        hidden_states = image_attn(
+                            hidden_states,
+                            encoder_hidden_states=image_encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
                 else:
                     hidden_states = resnet(hidden_states, temb)
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
-                    hidden_states = image_attn(
-                        hidden_states,
-                        encoder_hidden_states=image_encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if image_encoder_hidden_states is not None:
+                        hidden_states = image_attn(
+                            hidden_states,
+                            encoder_hidden_states=image_encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
 
                 # apply additional residuals to the output of the last pair of resnet and attention blocks
                 if i == len(blocks) - 1 and additional_residuals is not None:
@@ -1225,24 +1199,26 @@ class CrossAttnDownBlock2D(nn.Module):
                         temb,
                         **ckpt_kwargs,
                     )
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if encoder_hidden_states is not None:
+                        hidden_states = attn(
+                            hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
                 else:
                     hidden_states = resnet(hidden_states, temb)
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if encoder_hidden_states is not None:
+                        hidden_states = attn(
+                            hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
 
                 # apply additional residuals to the output of the last pair of resnet and attention blocks
                 if i == len(blocks) - 1 and additional_residuals is not None:
@@ -2367,7 +2343,7 @@ class CrossAttnUpBlock2D(nn.Module):
 
 
         if self.use_image_cross_attention:
-            for resnet, attn, image_attn in zip(self.resnets, self.attentions, self.image_attentions):
+            for resnet, image_attn in zip(self.resnets, self.image_attentions):
                 # pop res hidden states
                 res_hidden_states = res_hidden_states_tuple[-1]
                 res_hidden_states_tuple = res_hidden_states_tuple[:-1]
@@ -2391,42 +2367,26 @@ class CrossAttnUpBlock2D(nn.Module):
                         temb,
                         **ckpt_kwargs,
                     )
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
-                    hidden_states = image_attn(
-                        hidden_states,
-                        encoder_hidden_states=image_encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if image_encoder_hidden_states is not None:
+                        hidden_states = image_attn(
+                            hidden_states,
+                            encoder_hidden_states=image_encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
                 else:
                     hidden_states = resnet(hidden_states, temb)
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
-                    ## for image cross attention
-                    hidden_states = image_attn(
-                        hidden_states,
-                        encoder_hidden_states=image_encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if image_encoder_hidden_states is not None:
+                        hidden_states = image_attn(
+                            hidden_states,
+                            encoder_hidden_states=image_encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
         else:
             for resnet, attn in zip(self.resnets, self.attentions):
                 # pop res hidden states
@@ -2452,24 +2412,26 @@ class CrossAttnUpBlock2D(nn.Module):
                         temb,
                         **ckpt_kwargs,
                     )
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if encoder_hidden_states is not None:
+                        hidden_states = attn(
+                            hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
                 else:
                     hidden_states = resnet(hidden_states, temb)
-                    hidden_states = attn(
-                        hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        attention_mask=attention_mask,
-                        encoder_attention_mask=encoder_attention_mask,
-                        return_dict=False,
-                    )[0]
+                    if encoder_hidden_states is not None:
+                        hidden_states = attn(
+                            hidden_states,
+                            encoder_hidden_states=encoder_hidden_states,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            attention_mask=attention_mask,
+                            encoder_attention_mask=encoder_attention_mask,
+                            return_dict=False,
+                        )[0]
                 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
