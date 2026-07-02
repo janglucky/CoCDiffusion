@@ -70,7 +70,7 @@ def resolve_timestep_conditioning(args):
         return True
     if args.timestep_conditioning == "off":
         return False
-    return args.diffusion_process == "gaussian"
+    return args.diffusion_process in ("gaussian", "coc_image_latent")
 
 
 def load_seesr_pipeline(args, accelerator, enable_xformers_memory_efficient_attention):
@@ -166,7 +166,7 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             pad_width, pad_height = padding
             width, height = validation_image.size
             validation_depth = None
-            if args.diffusion_process in ("coc_blur", "coc_endpoint", "coc_image_latent") and args.use_depth:
+            if args.diffusion_process in ("coc_blur", "coc_endpoint") and args.use_depth:
                 depth_name = resolve_depth_path(args.depth_path, image_name)
                 if depth_name is None:
                     raise FileNotFoundError(f"Cannot find a depth map for `{image_name}`.")
@@ -306,7 +306,7 @@ if __name__ == "__main__":
         type=str,
         choices=["auto", "on", "off"],
         default="auto",
-        help="Use explicit timestep embeddings. auto keeps DDIM/gaussian on and CoC blur off.",
+        help="Use explicit timestep embeddings. auto keeps Gaussian and CoC image-latent on, and cold-diffusion CoC paths off.",
     )
     args = parser.parse_args()
     main(args)

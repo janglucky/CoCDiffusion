@@ -4,13 +4,13 @@
 
 ## CoCDiffusion
 
-本仓库基于 [cswry/SeeSR](https://github.com/cswry/SeeSR) 改造，当前目标只保留单图像去模糊任务。默认实验已经切换为 `coc_image_latent`：在图像域使用 CoC 离焦模型生成逐步模糊图，再编码到 latent space 中进行扩散状态建模。
+本仓库基于 [cswry/SeeSR](https://github.com/cswry/SeeSR) 改造，当前目标只保留单图像去模糊任务。默认实验已经切换为 `coc_image_latent`：在图像域使用 CoC 离焦模型生成逐步模糊图，再编码成 latent，作为官方 diffusers scheduler 中的替代噪声。
 
 当前版本的主要特点：
 - 删除文本分支和 `null_text`，避免文本侧 FLOPs
 - 删除 RAM/DAPE 图像语义分支，ControlNet 直接以原始模糊图为条件
 - 不做图像上采样，训练和测试都使用原始图像尺寸
-- 支持原始 DDIM、CoC blur、paired endpoint、CoC endpoint、CoC image-latent 等实验路径
+- 支持原始 DDIM/DDPM、CoC blur、paired endpoint、CoC endpoint、CoC image-latent 等实验路径
 - 默认训练目标只保留 latent-space MSE，不再使用图像重建损失或 SSIM 损失
 
 ## 方法概览
@@ -19,8 +19,8 @@
 
 ```text
 z_0 = VAE(gt)
-z_blur,t = VAE(CoCBlur(gt, depth, t))
-x_t = sqrt(alpha_t) * z_0 + sqrt(1 - alpha_t) * z_blur,t
+epsilon_coc,t = VAE(CoCBlur(gt, depth, t))
+x_t = scheduler.add_noise(z_0, epsilon_coc,t, t)
 ```
 
 其中：
@@ -28,18 +28,17 @@ x_t = sqrt(alpha_t) * z_0 + sqrt(1 - alpha_t) * z_blur,t
 - `depth` 是对应深度图
 - `CoCBlur(gt, depth, t)` 在图像域执行离焦模糊
 - `x_t` 是 latent-space 扩散状态
-- `alpha_t = 1 - blur_scale_t`，因此 `t=0` 时接近清晰 latent，`t=T` 时接近图像域 CoC blur 后的 latent
+- `scheduler.add_noise` 使用 diffusers 官方 scheduler 的 `alpha_prod_t`
+- CoC 模糊强度仍由 `blur_scale_t = (t / (T - 1)) ^ schedule_power` 控制
 
-反向过程使用模型预测的 clean latent `z_hat` 构造同一类退化：
+网络输出对齐标准 DDIM/DDPM 的噪声估计语义：在 `coc_image_latent` 中不预测 clean latent，而是预测当前 timestep 的 CoC 模糊 latent `epsilon_coc,t`。反向过程直接沿用官方 scheduler：
 
 ```text
-D_t(z_hat) = sqrt(alpha_t) * z_hat
-           + sqrt(1 - alpha_t) * VAE(CoCBlur(Decode(z_hat), depth, t))
-
-x_{t-1} = x_t - D_t(z_hat) + D_{t-1}(z_hat)
+epsilon_hat = model(x_t, t, source)
+x_{t-1} = scheduler.step(epsilon_hat, t, x_t)
 ```
 
-这保证 CoC 模糊发生在图像域，而扩散状态和网络输入输出仍然位于 latent space。
+这样 CoC 只负责生成图像域模糊，扩散混合和反向采样全部交给 diffusers 官方 scheduler。
 
 ## 环境
 
@@ -133,12 +132,12 @@ bash scripts/train_coc.sh
 - `DIFFUSION_PROCESS=coc_image_latent`
 - `UNET_TRAIN_PRESET=controlnet_interaction_full`
 - `CHECKPOINTING_STEPS=5000`
-- `--timestep_conditioning off`
+- `TIMESTEP_CONDITIONING=auto`，对 `coc_image_latent` 默认开启 timestep embedding
 
-当前训练损失只包含 latent MSE：
+当前训练损失只包含 latent MSE；`coc_image_latent` 的目标是图像域 CoC blur 后再编码得到的 `epsilon_coc,t`：
 
 ```text
-loss = MSE(model_pred, target_latent)
+loss = MSE(model_pred, epsilon_coc,t)
 ```
 
 不再计算图像重建损失和 SSIM 损失。
@@ -164,7 +163,7 @@ bash scripts/test_seesr.sh
 - `DIFFUSION_PROCESS=coc_image_latent`
 - `NUM_INFERENCE_STEPS=1`
 
-使用 depth 测试：
+`coc_blur` / `coc_endpoint` 旧实验路径使用 depth 测试：
 
 ```bash
 USE_DEPTH=1 \
@@ -172,7 +171,7 @@ DEPTH_PATH=/home/gd09385/data/test_c/depth \
 bash scripts/test_coc.sh
 ```
 
-不使用 depth 测试时，`coc_image_latent` 会使用全图 CoC 模糊近似作为退化路径，输入起点仍然是 `VAE(source)`。
+`coc_image_latent` 测试时不再需要 CoC scheduler；输入起点是 `VAE(source)`，反向采样使用 diffusers 官方 scheduler。
 
 多步测试示例：
 
@@ -201,7 +200,7 @@ DIFFUSION_PROCESS=coc_image_latent bash scripts/train_coc.sh
 - `coc_blur` 使用 CoC blur cold diffusion
 - `paired_endpoint` 在 clean/source latent 之间做 endpoint cold diffusion
 - `coc_endpoint` 使用 CoC 轨迹并以真实 source latent 作为端点
-- `coc_image_latent` 在图像域 CoC blur，再编码到 latent 中混合，是当前默认方法
+- `coc_image_latent` 在图像域 CoC blur，再编码成 latent 替换官方 DDIM/DDPM 中的噪声，是当前默认方法
 
 ## CoC 前向可视化
 
@@ -251,20 +250,19 @@ python eval_seesr.py \
 - `train_seesr.py`: 训练入口，支持多种 diffusion process
 - `test_seesr.py`: 测试入口，支持可选 depth
 - `pipelines/pipeline_seesr.py`: 推理 pipeline 和反向过程
-- `schedulers/coc_image_latent_scheduler.py`: 当前默认 CoC image-latent scheduler
+- `coc.py`: 图像域 CoC 离焦渲染器和 `add_coc_blur` 函数
 - `schedulers/coc_endpoint_scheduler.py`: CoC endpoint 对照 scheduler
 - `schedulers/paired_endpoint_scheduler.py`: paired endpoint 对照 scheduler
-- `coc.py`: 图像域 CoC 离焦渲染器
 - `dataloaders/triplet_dataset.py`: `source/target/depth` 三元组数据集
 - `dataloaders/paired_dataset.py`: `source/target` 成对数据集
 
 ## 已验证检查
 
 当前版本已完成以下轻量检查：
-- `python -m py_compile train_seesr.py test_seesr.py pipelines/pipeline_seesr.py schedulers/coc_image_latent_scheduler.py`
+- `python -m py_compile train_seesr.py test_seesr.py pipelines/pipeline_seesr.py coc.py`
 - `bash -n scripts/train_coc.sh && bash -n scripts/test_coc.sh`
 - `python test_seesr.py --help` 中已包含 `coc_image_latent`
-- `coc_image_latent` scheduler sanity check：`t=0` 为 clean latent，`t=T` 为 image-space CoC blur latent，预测正确时一步反推回 clean latent
+- `coc_image_latent` 使用官方 scheduler sanity check：CoC blur latent 作为 `epsilon` 传入 `add_noise/step`
 
 ## 致谢
 

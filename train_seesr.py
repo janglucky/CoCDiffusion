@@ -35,9 +35,9 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedImageDataset
 from dataloaders.triplet_dataset import TripletImageDataset
+from coc import add_coc_blur
 from schedulers.coc_blur_scheduler import CoCBlurScheduler
 from schedulers.coc_endpoint_scheduler import CoCEndpointScheduler
-from schedulers.coc_image_latent_scheduler import CoCImageLatentScheduler
 from schedulers.paired_endpoint_scheduler import PairedEndpointScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -420,7 +420,7 @@ def parse_args(input_args=None):
         help=(
             "Use the original Gaussian diffusion, CoC blur cold-diffusion process, "
             "paired-endpoint cold diffusion, CoC-guided paired-endpoint cold diffusion, "
-            "or image-space CoC blur mixed in latent space."
+            "or image-space CoC blur latent as the official scheduler noise."
         ),
     )
     parser.add_argument(
@@ -461,7 +461,7 @@ def parse_args(input_args=None):
         "--coc_max_radius",
         type=float,
         default=2.5,
-        help="Maximum latent-space CoC radius. Image-space radius is roughly 8x this value.",
+        help="Maximum CoC radius for image-space blur in coc_image_latent and legacy CoC experiments.",
     )
     parser.add_argument("--coc_gamma", type=float, default=1.5)
     parser.add_argument(
@@ -487,7 +487,7 @@ def parse_args(input_args=None):
         type=str,
         choices=["auto", "on", "off"],
         default="auto",
-        help="Use explicit timestep embeddings. auto keeps DDIM/gaussian on and CoC blur off.",
+        help="Use explicit timestep embeddings. auto keeps Gaussian and CoC image-latent on, and cold-diffusion CoC paths off.",
     )
 
     
@@ -512,7 +512,7 @@ def resolve_timestep_conditioning(args):
         return True
     if args.timestep_conditioning == "off":
         return False
-    return args.diffusion_process == "gaussian"
+    return args.diffusion_process in ("gaussian", "coc_image_latent")
 
 
 UNET_TRAIN_PRESETS = {
@@ -629,7 +629,6 @@ noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_pa
 coc_blur_scheduler = None
 paired_endpoint_scheduler = None
 coc_endpoint_scheduler = None
-coc_image_latent_scheduler = None
 if args.diffusion_process == "coc_blur":
     coc_blur_scheduler = CoCBlurScheduler(
         num_train_timesteps=noise_scheduler.config.num_train_timesteps,
@@ -654,25 +653,6 @@ elif args.diffusion_process == "paired_endpoint":
     )
 elif args.diffusion_process == "coc_endpoint":
     coc_endpoint_scheduler = CoCEndpointScheduler(
-        CoCBlurScheduler(
-            num_train_timesteps=noise_scheduler.config.num_train_timesteps,
-            focus_depth=args.coc_focus_depth,
-            focus_width=args.coc_focus_width,
-            max_radius=args.coc_max_radius,
-            gamma=args.coc_gamma,
-            schedule_power=args.coc_schedule_power,
-            global_blur_at_max=args.coc_global_blur_at_max,
-            depth_blur_strength=args.coc_depth_blur_strength,
-            focus_depth_min=args.coc_focus_depth_min,
-            focus_depth_max=args.coc_focus_depth_max,
-            focus_width_min=args.coc_focus_width_min,
-            focus_width_max=args.coc_focus_width_max,
-            global_blur_min=args.coc_global_blur_min,
-            global_blur_max=args.coc_global_blur_max,
-        )
-    )
-elif args.diffusion_process == "coc_image_latent":
-    coc_image_latent_scheduler = CoCImageLatentScheduler(
         CoCBlurScheduler(
             num_train_timesteps=noise_scheduler.config.num_train_timesteps,
             focus_depth=args.coc_focus_depth,
@@ -1026,6 +1006,7 @@ for epoch in range(first_epoch, args.num_train_epochs):
             # Sample a random timestep for each image
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
+            noise = None
 
             if args.diffusion_process == "gaussian":
                 # Original forward diffusion process.
@@ -1055,13 +1036,27 @@ for epoch in range(first_epoch, args.num_train_epochs):
             elif args.diffusion_process == "coc_image_latent":
                 depth = batch["depth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
                 with torch.no_grad():
-                    model_input_latents = coc_image_latent_scheduler.add_degradation(
+                    coc_blurred_image = add_coc_blur(
                         pixel_values,
-                        latents,
                         depth,
                         timesteps,
-                        encode_image_to_latents,
+                        num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+                        default_focus_depth=args.coc_focus_depth,
+                        default_focus_width=args.coc_focus_width,
+                        max_radius=args.coc_max_radius,
+                        gamma=args.coc_gamma,
+                        schedule_power=args.coc_schedule_power,
+                        global_blur_at_max=args.coc_global_blur_at_max,
+                        depth_blur_strength=args.coc_depth_blur_strength,
+                        focus_depth_min=args.coc_focus_depth_min,
+                        focus_depth_max=args.coc_focus_depth_max,
+                        focus_width_min=args.coc_focus_width_min,
+                        focus_width_max=args.coc_focus_width_max,
+                        global_blur_min=args.coc_global_blur_min,
+                        global_blur_max=args.coc_global_blur_max,
                     )
+                    noise = encode_image_to_latents(coc_blurred_image)
+                model_input_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             else:
                 degraded_endpoint_latents = vae.encode(controlnet_image * 2.0 - 1.0).latent_dist.sample()
                 degraded_endpoint_latents = degraded_endpoint_latents * vae.config.scaling_factor
@@ -1090,7 +1085,7 @@ for epoch in range(first_epoch, args.num_train_epochs):
             ).sample       
 
             # Get the target for loss depending on the prediction type
-            if args.diffusion_process == "gaussian":
+            if args.diffusion_process in ("gaussian", "coc_image_latent"):
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":

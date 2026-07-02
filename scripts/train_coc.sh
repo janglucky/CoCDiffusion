@@ -37,6 +37,7 @@ COC_GAMMA="${COC_GAMMA:-1.5}"
 COC_SCHEDULE_POWER="${COC_SCHEDULE_POWER:-3.0}"
 COC_GLOBAL_BLUR_AT_MAX="${COC_GLOBAL_BLUR_AT_MAX:-0.0}"
 COC_DEPTH_BLUR_STRENGTH="${COC_DEPTH_BLUR_STRENGTH:-1.0}"
+TIMESTEP_CONDITIONING="${TIMESTEP_CONDITIONING:-auto}"
 
 cmd=(
   accelerate launch train_seesr.py
@@ -68,7 +69,7 @@ cmd=(
   --coc_schedule_power "${COC_SCHEDULE_POWER}"
   --coc_global_blur_at_max "${COC_GLOBAL_BLUR_AT_MAX}"
   --coc_depth_blur_strength "${COC_DEPTH_BLUR_STRENGTH}"
-  --timestep_conditioning off
+  --timestep_conditioning "${TIMESTEP_CONDITIONING}"
 )
 
 if [[ "${DIFFUSION_PROCESS}" == "coc_blur" ]]; then

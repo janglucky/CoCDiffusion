@@ -35,6 +35,7 @@ USE_DEPTH="${USE_DEPTH:-}"
 START_BLUR_SIGMA="${START_BLUR_SIGMA:-8.0}"
 START_BLUR_KERNEL_SIZE="${START_BLUR_KERNEL_SIZE:-}"
 UPDATE_BLEND="${UPDATE_BLEND:-1.0}"
+TIMESTEP_CONDITIONING="${TIMESTEP_CONDITIONING:-auto}"
 
 cmd=(
   python test_seesr.py
@@ -65,7 +66,7 @@ cmd=(
   --coc_inference_start "${COC_INFERENCE_START}"
   --start_blur_sigma "${START_BLUR_SIGMA}"
   --update_blend "${UPDATE_BLEND}"
-  --timestep_conditioning off
+  --timestep_conditioning "${TIMESTEP_CONDITIONING}"
 )
 
 if [[ -n "${USE_DEPTH}" ]]; then
