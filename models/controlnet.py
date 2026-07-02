@@ -209,6 +209,7 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
         global_pool_conditions: bool = False,
         addition_embed_type_num_heads=64,
         use_image_cross_attention=False,
+        use_timestep_conditioning: bool = True,
     ):
         super().__init__()
 
@@ -248,13 +249,18 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
 
         # time
         time_embed_dim = block_out_channels[0] * 4
-        self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
         timestep_input_dim = block_out_channels[0]
-        self.time_embedding = TimestepEmbedding(
-            timestep_input_dim,
-            time_embed_dim,
-            act_fn=act_fn,
-        )
+        if use_timestep_conditioning:
+            self.time_proj = Timesteps(block_out_channels[0], flip_sin_to_cos, freq_shift)
+            self.time_embedding = TimestepEmbedding(
+                timestep_input_dim,
+                time_embed_dim,
+                act_fn=act_fn,
+            )
+        else:
+            self.time_proj = None
+            self.time_embedding = None
+        blocks_time_embed_dim = time_embed_dim if use_timestep_conditioning else None
 
         if encoder_hid_dim_type is None and encoder_hid_dim is not None:
             encoder_hid_dim_type = "text_proj"
@@ -368,7 +374,7 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
                 transformer_layers_per_block=transformer_layers_per_block[i],
                 in_channels=input_channel,
                 out_channels=output_channel,
-                temb_channels=time_embed_dim,
+                temb_channels=blocks_time_embed_dim,
                 add_downsample=not is_final_block,
                 resnet_eps=norm_eps,
                 resnet_act_fn=act_fn,
@@ -405,7 +411,7 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
         self.mid_block = UNetMidBlock2DCrossAttn(
             transformer_layers_per_block=transformer_layers_per_block[-1],
             in_channels=mid_block_channel,
-            temb_channels=time_embed_dim,
+            temb_channels=blocks_time_embed_dim,
             resnet_eps=norm_eps,
             resnet_act_fn=act_fn,
             output_scale_factor=mid_block_scale_factor,
@@ -475,12 +481,19 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
             controlnet_conditioning_channel_order=controlnet_conditioning_channel_order,
             conditioning_embedding_out_channels=conditioning_embedding_out_channels,
             use_image_cross_attention=use_image_cross_attention,
+            use_timestep_conditioning=(
+                unet.config.use_timestep_conditioning
+                if "use_timestep_conditioning" in unet.config
+                else True
+            ),
         )
 
         if load_weights_from_unet:
             controlnet.conv_in.load_state_dict(unet.conv_in.state_dict())
-            controlnet.time_proj.load_state_dict(unet.time_proj.state_dict())
-            controlnet.time_embedding.load_state_dict(unet.time_embedding.state_dict())
+            if controlnet.time_proj is not None and unet.time_proj is not None:
+                controlnet.time_proj.load_state_dict(unet.time_proj.state_dict())
+            if controlnet.time_embedding is not None and unet.time_embedding is not None:
+                controlnet.time_embedding.load_state_dict(unet.time_embedding.state_dict())
 
             if controlnet.class_embedding:
                 controlnet.class_embedding.load_state_dict(unet.class_embedding.state_dict())
@@ -630,7 +643,7 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
     def forward(
         self,
         sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: Optional[Union[torch.Tensor, float, int]] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         controlnet_cond: torch.FloatTensor = None,
         conditioning_scale: float = 1.0,
@@ -693,65 +706,70 @@ class ControlNetModel(ModelMixin, ConfigMixin, FromOriginalControlnetMixin):
             attention_mask = attention_mask.unsqueeze(1)
 
         # 1. time
-        timesteps = timestep
-        if not torch.is_tensor(timesteps):
-            # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
-            # This would be a good case for the `match` statement (Python 3.10+)
-            is_mps = sample.device.type == "mps"
-            if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
-            else:
-                dtype = torch.int32 if is_mps else torch.int64
-            timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
-        elif len(timesteps.shape) == 0:
-            timesteps = timesteps[None].to(sample.device)
+        emb = None
+        if getattr(self.config, "use_timestep_conditioning", True):
+            if timestep is None:
+                raise ValueError("`timestep` must be provided when timestep conditioning is enabled.")
 
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
+            timesteps = timestep
+            if not torch.is_tensor(timesteps):
+                # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
+                # This would be a good case for the `match` statement (Python 3.10+)
+                is_mps = sample.device.type == "mps"
+                if isinstance(timestep, float):
+                    dtype = torch.float32 if is_mps else torch.float64
+                else:
+                    dtype = torch.int32 if is_mps else torch.int64
+                timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
+            elif len(timesteps.shape) == 0:
+                timesteps = timesteps[None].to(sample.device)
 
-        t_emb = self.time_proj(timesteps)
+            # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+            timesteps = timesteps.expand(sample.shape[0])
 
-        # timesteps does not contain any weights and will always return f32 tensors
-        # but time_embedding might actually be running in fp16. so we need to cast here.
-        # there might be better ways to encapsulate this.
-        t_emb = t_emb.to(dtype=sample.dtype)
+            t_emb = self.time_proj(timesteps)
 
-        emb = self.time_embedding(t_emb, timestep_cond)
-        aug_emb = None
+            # timesteps does not contain any weights and will always return f32 tensors
+            # but time_embedding might actually be running in fp16. so we need to cast here.
+            # there might be better ways to encapsulate this.
+            t_emb = t_emb.to(dtype=sample.dtype)
 
-        if self.class_embedding is not None:
-            if class_labels is None:
-                raise ValueError("class_labels should be provided when num_class_embeds > 0")
+            emb = self.time_embedding(t_emb, timestep_cond)
+            aug_emb = None
 
-            if self.config.class_embed_type == "timestep":
-                class_labels = self.time_proj(class_labels)
+            if self.class_embedding is not None:
+                if class_labels is None:
+                    raise ValueError("class_labels should be provided when num_class_embeds > 0")
 
-            class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
-            emb = emb + class_emb
+                if self.config.class_embed_type == "timestep":
+                    class_labels = self.time_proj(class_labels)
 
-        if self.config.addition_embed_type is not None:
-            if self.config.addition_embed_type == "text":
-                aug_emb = self.add_embedding(encoder_hidden_states)
+                class_emb = self.class_embedding(class_labels).to(dtype=self.dtype)
+                emb = emb + class_emb
 
-            elif self.config.addition_embed_type == "text_time":
-                if "text_embeds" not in added_cond_kwargs:
-                    raise ValueError(
-                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
-                    )
-                text_embeds = added_cond_kwargs.get("text_embeds")
-                if "time_ids" not in added_cond_kwargs:
-                    raise ValueError(
-                        f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
-                    )
-                time_ids = added_cond_kwargs.get("time_ids")
-                time_embeds = self.add_time_proj(time_ids.flatten())
-                time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
+            if self.config.addition_embed_type is not None:
+                if self.config.addition_embed_type == "text":
+                    aug_emb = self.add_embedding(encoder_hidden_states)
 
-                add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
-                add_embeds = add_embeds.to(emb.dtype)
-                aug_emb = self.add_embedding(add_embeds)
+                elif self.config.addition_embed_type == "text_time":
+                    if "text_embeds" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `text_embeds` to be passed in `added_cond_kwargs`"
+                        )
+                    text_embeds = added_cond_kwargs.get("text_embeds")
+                    if "time_ids" not in added_cond_kwargs:
+                        raise ValueError(
+                            f"{self.__class__} has the config param `addition_embed_type` set to 'text_time' which requires the keyword argument `time_ids` to be passed in `added_cond_kwargs`"
+                        )
+                    time_ids = added_cond_kwargs.get("time_ids")
+                    time_embeds = self.add_time_proj(time_ids.flatten())
+                    time_embeds = time_embeds.reshape((text_embeds.shape[0], -1))
 
-        emb = emb + aug_emb if aug_emb is not None else emb
+                    add_embeds = torch.concat([text_embeds, time_embeds], dim=-1)
+                    add_embeds = add_embeds.to(emb.dtype)
+                    aug_emb = self.add_embedding(add_embeds)
+
+            emb = emb + aug_emb if aug_emb is not None else emb
 
         # 2. pre-process
         sample = self.conv_in(sample)

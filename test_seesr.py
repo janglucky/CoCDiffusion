@@ -34,8 +34,44 @@ def pad_image_to_multiple(image, multiple=8):
         return image, (0, 0)
 
     image_array = np.asarray(image)
-    padded_array = np.pad(image_array, ((0, pad_height), (0, pad_width), (0, 0)), mode="edge")
+    if image_array.ndim == 2:
+        pad_widths = ((0, pad_height), (0, pad_width))
+    else:
+        pad_widths = ((0, pad_height), (0, pad_width), (0, 0))
+    padded_array = np.pad(image_array, pad_widths, mode="edge")
     return Image.fromarray(padded_array), (pad_width, pad_height)
+
+
+def infer_depth_path(image_path):
+    image_path = os.path.abspath(image_path)
+    parent = os.path.dirname(image_path)
+    if os.path.basename(parent) == "source":
+        candidate = os.path.join(os.path.dirname(parent), "depth", os.path.basename(image_path))
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def resolve_depth_path(depth_path, image_path):
+    if depth_path is None:
+        return infer_depth_path(image_path)
+    if os.path.isdir(depth_path):
+        candidate = os.path.join(depth_path, os.path.basename(image_path))
+        if os.path.exists(candidate):
+            return candidate
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        matches = sorted(glob.glob(os.path.join(depth_path, f"{stem}.*")))
+        return matches[0] if matches else None
+    return depth_path
+
+
+def resolve_timestep_conditioning(args):
+    if args.timestep_conditioning == "on":
+        return True
+    if args.timestep_conditioning == "off":
+        return False
+    return args.diffusion_process == "gaussian"
+
 
 def load_seesr_pipeline(args, accelerator, enable_xformers_memory_efficient_attention):
     
@@ -43,11 +79,21 @@ def load_seesr_pipeline(args, accelerator, enable_xformers_memory_efficient_atte
     from models.unet_2d_condition import UNet2DConditionModel
 
     # Load scheduler and models.
-    
+    use_timestep_conditioning = resolve_timestep_conditioning(args)
+
     scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_path, subfolder="scheduler")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_path, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(args.seesr_model_path, subfolder="unet")
-    controlnet = ControlNetModel.from_pretrained(args.seesr_model_path, subfolder="controlnet")
+    unet = UNet2DConditionModel.from_pretrained(
+        args.seesr_model_path,
+        subfolder="unet",
+        use_timestep_conditioning=use_timestep_conditioning,
+    )
+    controlnet = ControlNetModel.from_pretrained(
+        args.seesr_model_path,
+        subfolder="controlnet",
+        use_timestep_conditioning=use_timestep_conditioning,
+    )
+    logger.info(f"Explicit timestep conditioning: {use_timestep_conditioning}")
     
     # Freeze models
     vae.requires_grad_(False)
@@ -119,6 +165,17 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             validation_image, padding = pad_image_to_multiple(validation_image, multiple=8)
             pad_width, pad_height = padding
             width, height = validation_image.size
+            validation_depth = None
+            if args.diffusion_process == "coc_blur" and args.use_depth:
+                depth_name = resolve_depth_path(args.depth_path, image_name)
+                if depth_name is None:
+                    raise FileNotFoundError(f"Cannot find a depth map for `{image_name}`.")
+                validation_depth = Image.open(depth_name).convert("L")
+                validation_depth, depth_padding = pad_image_to_multiple(validation_depth, multiple=8)
+                if validation_depth.size != validation_image.size:
+                    raise ValueError(f"Depth size mismatch between `{image_name}` and `{depth_name}`.")
+                if depth_padding != padding:
+                    raise ValueError(f"Depth padding mismatch between `{image_name}` and `{depth_name}`.")
 
             if pad_width or pad_height:
                 print(f'input size: {ori_height}x{ori_width}, padded to {height}x{width}')
@@ -131,10 +188,19 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             for sample_idx in range(args.sample_times):  
                 with torch.autocast("cuda"):
                     image = pipeline(
-                            validation_image, num_inference_steps=args.num_inference_steps, generator=generator, height=height, width=width,
+                            validation_image, depth=validation_depth, num_inference_steps=args.num_inference_steps, generator=generator, height=height, width=width,
                             conditioning_scale=args.conditioning_scale,
                             start_point=args.start_point,
                             latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap,
+                            diffusion_process=args.diffusion_process,
+                            coc_focus_depth=args.coc_focus_depth,
+                            coc_max_radius=args.coc_max_radius,
+                            coc_gamma=args.coc_gamma,
+                            coc_schedule_power=args.coc_schedule_power,
+                            coc_inference_start=args.coc_inference_start,
+                            start_blur_sigma=args.start_blur_sigma,
+                            start_blur_kernel_size=args.start_blur_kernel_size,
+                            update_blend=args.update_blend,
                             args=args,
                         ).images[0]
                 
@@ -159,6 +225,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_model_path", type=str, default=None)
     parser.add_argument("--image_path", type=str, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--depth_path", type=str, default=None)
     parser.add_argument("--mixed_precision", type=str, default="fp16") # no/fp16/bf16
     parser.add_argument("--conditioning_scale", type=float, default=1.0)
     parser.add_argument("--blending_alpha", type=float, default=1.0)
@@ -172,5 +239,22 @@ if __name__ == "__main__":
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain')
     parser.add_argument("--start_steps", type=int, default=999) # defaults set to 999.
     parser.add_argument("--start_point", type=str, choices=['lr', 'noise'], default='lr') # LR Embedding Strategy, choose 'lr latent + 999 steps noise' as diffusion start point. 
+    parser.add_argument("--diffusion_process", type=str, choices=["gaussian", "coc_blur"], default="gaussian")
+    parser.add_argument("--coc_focus_depth", type=float, default=0.7)
+    parser.add_argument("--coc_max_radius", type=float, default=2.5)
+    parser.add_argument("--coc_gamma", type=float, default=1.5)
+    parser.add_argument("--coc_schedule_power", type=float, default=1.0)
+    parser.add_argument("--coc_inference_start", type=str, choices=["encoded_input", "gaussian_blur"], default="encoded_input")
+    parser.add_argument("--use_depth", action="store_true")
+    parser.add_argument("--start_blur_sigma", type=float, default=8.0)
+    parser.add_argument("--start_blur_kernel_size", type=int, default=None)
+    parser.add_argument("--update_blend", type=float, default=1.0)
+    parser.add_argument(
+        "--timestep_conditioning",
+        type=str,
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Use explicit timestep embeddings. auto keeps DDIM/gaussian on and CoC blur off.",
+    )
     args = parser.parse_args()
     main(args)

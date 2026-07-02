@@ -33,6 +33,8 @@ from diffusers.utils import check_min_version
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedImageDataset
+from dataloaders.triplet_dataset import TripletImageDataset
+from schedulers.coc_blur_scheduler import CoCBlurScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.21.0.dev0")
@@ -369,6 +371,29 @@ def parse_args(input_args=None):
 
     parser.add_argument("--root_folders",  type=str , default='' )
     parser.add_argument('--trainable_modules', nargs='*', type=str, default=["controlnet"])
+    parser.add_argument(
+        "--diffusion_process",
+        type=str,
+        choices=["gaussian", "coc_blur"],
+        default="gaussian",
+        help="Use the original Gaussian diffusion or CoC blur cold-diffusion process.",
+    )
+    parser.add_argument("--coc_focus_depth", type=float, default=0.7)
+    parser.add_argument(
+        "--coc_max_radius",
+        type=float,
+        default=2.5,
+        help="Maximum latent-space CoC radius. Image-space radius is roughly 8x this value.",
+    )
+    parser.add_argument("--coc_gamma", type=float, default=1.5)
+    parser.add_argument("--coc_schedule_power", type=float, default=1.0)
+    parser.add_argument(
+        "--timestep_conditioning",
+        type=str,
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Use explicit timestep embeddings. auto keeps DDIM/gaussian on and CoC blur off.",
+    )
 
     
     
@@ -387,9 +412,18 @@ def parse_args(input_args=None):
     return args
 
 
+def resolve_timestep_conditioning(args):
+    if args.timestep_conditioning == "on":
+        return True
+    if args.timestep_conditioning == "off":
+        return False
+    return args.diffusion_process == "gaussian"
+
+
 # def main(args):
 args = parse_args()
 logging_dir = Path(args.output_dir, args.logging_dir)
+use_timestep_conditioning = resolve_timestep_conditioning(args)
 
 
 from accelerate import DistributedDataParallelKwargs
@@ -433,6 +467,15 @@ if accelerator.is_main_process:
 
 # Load scheduler and models
 noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+coc_blur_scheduler = None
+if args.diffusion_process == "coc_blur":
+    coc_blur_scheduler = CoCBlurScheduler(
+        num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+        focus_depth=args.coc_focus_depth,
+        max_radius=args.coc_max_radius,
+        gamma=args.coc_gamma,
+        schedule_power=args.coc_schedule_power,
+    )
 vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
 # unet = UNet2DConditionModel.from_pretrained(
 #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
@@ -441,24 +484,39 @@ if args.unet_model_name_or_path:
     # resume from self-train
     logger.info("Loading unet weights from self-train")
     unet = UNet2DConditionModel.from_pretrained_orig(
-        args.pretrained_model_name_or_path, args.unet_model_name_or_path, subfolder="unet", revision=args.revision, use_image_cross_attention=False
+        args.pretrained_model_name_or_path,
+        args.unet_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        use_image_cross_attention=False,
+        use_timestep_conditioning=use_timestep_conditioning,
     )
 else:
     # resume from pretrained SD
     logger.info("Loading unet weights from SD")
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, use_image_cross_attention=False
+        args.pretrained_model_name_or_path,
+        subfolder="unet",
+        revision=args.revision,
+        use_image_cross_attention=False,
+        use_timestep_conditioning=use_timestep_conditioning,
     )
     print(f'===== use cross attention? {unet.config.use_image_cross_attention}')
 
 if args.controlnet_model_name_or_path:
     # resume from self-train
     logger.info("Loading existing controlnet weights")
-    controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path, subfolder="controlnet")
+    controlnet = ControlNetModel.from_pretrained(
+        args.controlnet_model_name_or_path,
+        subfolder="controlnet",
+        use_timestep_conditioning=use_timestep_conditioning,
+    )
 
 else:
     logger.info("Initializing controlnet weights from unet")
     controlnet = ControlNetModel.from_unet(unet, use_image_cross_attention=False)
+
+logger.info(f"Explicit timestep conditioning: {use_timestep_conditioning}")
     
 
 # `accelerate` 0.16.0 will have better support for customized saving
@@ -589,8 +647,10 @@ optimizer = optimizer_class(
     eps=args.adam_epsilon,
 )
 
-train_dataset = PairedImageDataset(root_folders=args.root_folders,
-)
+if args.diffusion_process == "coc_blur":
+    train_dataset = TripletImageDataset(root_folders=args.root_folders)
+else:
+    train_dataset = PairedImageDataset(root_folders=args.root_folders)
 
 train_dataloader = torch.utils.data.DataLoader(
     train_dataset,
@@ -715,30 +775,33 @@ for epoch in range(first_epoch, args.num_train_epochs):
             latents = vae.encode(pixel_values).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
 
-            # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)
             bsz = latents.shape[0]
             # Sample a random timestep for each image
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            if args.diffusion_process == "gaussian":
+                # Original forward diffusion process.
+                noise = torch.randn_like(latents)
+                model_input_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            else:
+                depth = batch["depth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                model_input_latents = coc_blur_scheduler.add_blur(latents, depth, timesteps)
+            model_timesteps = timesteps if use_timestep_conditioning else None
 
             controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
 
             down_block_res_samples, mid_block_res_sample = controlnet(
-                noisy_latents,
-                timesteps,
+                model_input_latents,
+                model_timesteps,
                 controlnet_cond=controlnet_image,
                 return_dict=False,
             )
 
             # Predict the noise residual
             model_pred = unet(
-                noisy_latents,
-                timesteps,
+                model_input_latents,
+                model_timesteps,
                 down_block_additional_residuals=[
                     sample.to(dtype=weight_dtype) for sample in down_block_res_samples
                 ],
@@ -746,12 +809,15 @@ for epoch in range(first_epoch, args.num_train_epochs):
             ).sample       
 
             # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            if args.diffusion_process == "gaussian":
+                if noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif noise_scheduler.config.prediction_type == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
             else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                target = latents
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             accelerator.backward(loss)
@@ -786,10 +852,10 @@ for epoch in range(first_epoch, args.num_train_epochs):
 accelerator.wait_for_everyone()
 if accelerator.is_main_process:
     controlnet = accelerator.unwrap_model(controlnet)
-    controlnet.save_pretrained(args.output_dir)
+    controlnet.save_pretrained(os.path.join(args.output_dir, "controlnet"))
 
     unet = accelerator.unwrap_model(unet)
-    unet.save_pretrained(args.output_dir)
+    unet.save_pretrained(os.path.join(args.output_dir, "unet"))
 
     if args.push_to_hub:
         save_model_card(
