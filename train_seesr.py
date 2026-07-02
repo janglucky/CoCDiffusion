@@ -380,13 +380,52 @@ def parse_args(input_args=None):
     )
     parser.add_argument("--coc_focus_depth", type=float, default=0.7)
     parser.add_argument(
+        "--coc_focus_width",
+        type=float,
+        default=0.0,
+        help="Half-width of the in-focus depth band when random focus width is disabled.",
+    )
+    parser.add_argument("--coc_focus_depth_min", type=float, default=0.1)
+    parser.add_argument("--coc_focus_depth_max", type=float, default=0.9)
+    parser.add_argument("--coc_focus_width_min", type=float, default=0.0)
+    parser.add_argument("--coc_focus_width_max", type=float, default=0.12)
+    parser.add_argument(
+        "--coc_global_blur_min",
+        type=float,
+        default=0.0,
+        help="Minimum global defocus floor sampled independently from timestep. 0.0 keeps local depth blur.",
+    )
+    parser.add_argument(
+        "--coc_global_blur_max",
+        type=float,
+        default=1.0,
+        help="Maximum global defocus floor sampled independently from timestep. 1.0 allows full-image blur.",
+    )
+    parser.add_argument(
         "--coc_max_radius",
         type=float,
         default=2.5,
         help="Maximum latent-space CoC radius. Image-space radius is roughly 8x this value.",
     )
     parser.add_argument("--coc_gamma", type=float, default=1.5)
-    parser.add_argument("--coc_schedule_power", type=float, default=1.0)
+    parser.add_argument(
+        "--coc_schedule_power",
+        type=float,
+        default=3.0,
+        help="Power for timestep-to-blur mapping. Larger values keep early timesteps cleaner and accelerate blur near the end.",
+    )
+    parser.add_argument(
+        "--coc_global_blur_at_max",
+        type=float,
+        default=0.0,
+        help="Optional global blur floor. Keep 0.0 for physical defocus where the focus band can remain sharp.",
+    )
+    parser.add_argument(
+        "--coc_depth_blur_strength",
+        type=float,
+        default=1.0,
+        help="Strength of depth-dependent radius variation before the global blur floor is applied.",
+    )
     parser.add_argument(
         "--timestep_conditioning",
         type=str,
@@ -472,9 +511,18 @@ if args.diffusion_process == "coc_blur":
     coc_blur_scheduler = CoCBlurScheduler(
         num_train_timesteps=noise_scheduler.config.num_train_timesteps,
         focus_depth=args.coc_focus_depth,
+        focus_width=args.coc_focus_width,
         max_radius=args.coc_max_radius,
         gamma=args.coc_gamma,
         schedule_power=args.coc_schedule_power,
+        global_blur_at_max=args.coc_global_blur_at_max,
+        depth_blur_strength=args.coc_depth_blur_strength,
+        focus_depth_min=args.coc_focus_depth_min,
+        focus_depth_max=args.coc_focus_depth_max,
+        focus_width_min=args.coc_focus_width_min,
+        focus_width_max=args.coc_focus_width_max,
+        global_blur_min=args.coc_global_blur_min,
+        global_blur_max=args.coc_global_blur_max,
     )
 vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
 # unet = UNet2DConditionModel.from_pretrained(

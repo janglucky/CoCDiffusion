@@ -8,17 +8,16 @@ set -u
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 PRETRAINED_MODEL_PATH="${PRETRAINED_MODEL_PATH:-/home/gd09385/models/stable-diffusion-2-base}"
-SEESR_MODEL_PATH="${SEESR_MODEL_PATH:-/home/gd09385/models/seesr}"
-ROOT_FOLDERS="${ROOT_FOLDERS:-/home/gd09385/data/test_c_sub}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_blur_cured}"
-MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
-LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
-CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-5000}"
-MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
-RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-latest}"
+IMAGE_PATH="${IMAGE_PATH:-/home/gd09385/data/test_c/target/1P0A0916.png}"
+DEPTH_PATH="${DEPTH_PATH:-/home/gd09385/data/test_c/depth/1P0A0917.png}"
+SOURCE_PATH="${SOURCE_PATH:-}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/coc_forward_visualization}"
+MODE="${MODE:-both}"
+TIMESTEPS="${TIMESTEPS:-0 100 250 500 750 999}"
+MAX_SIZE="${MAX_SIZE:-768}"
+SEED="${SEED:-123}"
+MATRIX_ROWS="${MATRIX_ROWS:-5}"
+MATRIX_AXIS="${MATRIX_AXIS:-global_blur}"
 COC_FOCUS_DEPTH="${COC_FOCUS_DEPTH:-0.7}"
 COC_FOCUS_WIDTH="${COC_FOCUS_WIDTH:-0.0}"
 COC_FOCUS_DEPTH_MIN="${COC_FOCUS_DEPTH_MIN:-0.1}"
@@ -32,22 +31,22 @@ COC_GAMMA="${COC_GAMMA:-1.5}"
 COC_SCHEDULE_POWER="${COC_SCHEDULE_POWER:-3.0}"
 COC_GLOBAL_BLUR_AT_MAX="${COC_GLOBAL_BLUR_AT_MAX:-0.0}"
 COC_DEPTH_BLUR_STRENGTH="${COC_DEPTH_BLUR_STRENGTH:-1.0}"
+IMAGE_RADIUS_MULTIPLIER="${IMAGE_RADIUS_MULTIPLIER:-8.0}"
+
+read -r -a TIMESTEP_ARRAY <<< "${TIMESTEPS}"
 
 cmd=(
-  accelerate launch train_seesr.py
-  --pretrained_model_name_or_path "${PRETRAINED_MODEL_PATH}"
-  --controlnet_model_name_or_path "${SEESR_MODEL_PATH}"
-  --unet_model_name_or_path "${SEESR_MODEL_PATH}"
+  python scripts/visualize_coc_forward.py
+  --pretrained_model_path "${PRETRAINED_MODEL_PATH}"
+  --image_path "${IMAGE_PATH}"
+  --depth_path "${DEPTH_PATH}"
   --output_dir "${OUTPUT_DIR}"
-  --root_folders "${ROOT_FOLDERS}"
-  --enable_xformers_memory_efficient_attention
-  --mixed_precision "${MIXED_PRECISION}"
-  --learning_rate "${LEARNING_RATE}"
-  --train_batch_size "${TRAIN_BATCH_SIZE}"
-  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
-  --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
-  --checkpointing_steps "${CHECKPOINTING_STEPS}"
-  --diffusion_process coc_blur
+  --mode "${MODE}"
+  --timesteps "${TIMESTEP_ARRAY[@]}"
+  --max_size "${MAX_SIZE}"
+  --seed "${SEED}"
+  --matrix_rows "${MATRIX_ROWS}"
+  --matrix_axis "${MATRIX_AXIS}"
   --coc_focus_depth "${COC_FOCUS_DEPTH}"
   --coc_focus_width "${COC_FOCUS_WIDTH}"
   --coc_focus_depth_min "${COC_FOCUS_DEPTH_MIN}"
@@ -61,15 +60,11 @@ cmd=(
   --coc_schedule_power "${COC_SCHEDULE_POWER}"
   --coc_global_blur_at_max "${COC_GLOBAL_BLUR_AT_MAX}"
   --coc_depth_blur_strength "${COC_DEPTH_BLUR_STRENGTH}"
-  --timestep_conditioning off
+  --image_radius_multiplier "${IMAGE_RADIUS_MULTIPLIER}"
 )
 
-if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
-  cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
-fi
-
-if [[ -n "${MAX_TRAIN_STEPS}" ]]; then
-  cmd+=(--max_train_steps "${MAX_TRAIN_STEPS}")
+if [[ -n "${SOURCE_PATH}" ]]; then
+  cmd+=(--source_path "${SOURCE_PATH}")
 fi
 
 "${cmd[@]}" "$@"

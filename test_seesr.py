@@ -194,9 +194,18 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
                             latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap,
                             diffusion_process=args.diffusion_process,
                             coc_focus_depth=args.coc_focus_depth,
+                            coc_focus_width=args.coc_focus_width,
+                            coc_focus_depth_min=args.coc_focus_depth_min,
+                            coc_focus_depth_max=args.coc_focus_depth_max,
+                            coc_focus_width_min=args.coc_focus_width_min,
+                            coc_focus_width_max=args.coc_focus_width_max,
+                            coc_global_blur_min=args.coc_global_blur_min,
+                            coc_global_blur_max=args.coc_global_blur_max,
                             coc_max_radius=args.coc_max_radius,
                             coc_gamma=args.coc_gamma,
                             coc_schedule_power=args.coc_schedule_power,
+                            coc_global_blur_at_max=args.coc_global_blur_at_max,
+                            coc_depth_blur_strength=args.coc_depth_blur_strength,
                             coc_inference_start=args.coc_inference_start,
                             start_blur_sigma=args.start_blur_sigma,
                             start_blur_kernel_size=args.start_blur_kernel_size,
@@ -241,9 +250,23 @@ if __name__ == "__main__":
     parser.add_argument("--start_point", type=str, choices=['lr', 'noise'], default='lr') # LR Embedding Strategy, choose 'lr latent + 999 steps noise' as diffusion start point. 
     parser.add_argument("--diffusion_process", type=str, choices=["gaussian", "coc_blur"], default="gaussian")
     parser.add_argument("--coc_focus_depth", type=float, default=0.7)
+    parser.add_argument("--coc_focus_width", type=float, default=0.0)
+    parser.add_argument("--coc_focus_depth_min", type=float, default=0.1)
+    parser.add_argument("--coc_focus_depth_max", type=float, default=0.9)
+    parser.add_argument("--coc_focus_width_min", type=float, default=0.0)
+    parser.add_argument("--coc_focus_width_max", type=float, default=0.12)
+    parser.add_argument("--coc_global_blur_min", type=float, default=0.0)
+    parser.add_argument("--coc_global_blur_max", type=float, default=1.0)
     parser.add_argument("--coc_max_radius", type=float, default=2.5)
     parser.add_argument("--coc_gamma", type=float, default=1.5)
-    parser.add_argument("--coc_schedule_power", type=float, default=1.0)
+    parser.add_argument(
+        "--coc_schedule_power",
+        type=float,
+        default=3.0,
+        help="Power for timestep-to-blur mapping. Larger values keep early timesteps cleaner and accelerate blur near the end.",
+    )
+    parser.add_argument("--coc_global_blur_at_max", type=float, default=0.0)
+    parser.add_argument("--coc_depth_blur_strength", type=float, default=1.0)
     parser.add_argument("--coc_inference_start", type=str, choices=["encoded_input", "gaussian_blur"], default="encoded_input")
     parser.add_argument("--use_depth", action="store_true")
     parser.add_argument("--start_blur_sigma", type=float, default=8.0)

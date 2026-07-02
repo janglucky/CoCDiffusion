@@ -563,9 +563,18 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         latent_tiled_overlap=4,
         diffusion_process="gaussian",
         coc_focus_depth=0.7,
+        coc_focus_width=0.0,
+        coc_focus_depth_min=0.1,
+        coc_focus_depth_max=0.9,
+        coc_focus_width_min=0.0,
+        coc_focus_width_max=0.12,
+        coc_global_blur_min=0.0,
+        coc_global_blur_max=1.0,
         coc_max_radius=2.5,
         coc_gamma=1.5,
-        coc_schedule_power=1.0,
+        coc_schedule_power=3.0,
+        coc_global_blur_at_max=0.0,
+        coc_depth_blur_strength=1.0,
         coc_inference_start="encoded_input",
         start_blur_sigma=8.0,
         start_blur_kernel_size=None,
@@ -699,9 +708,18 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             coc_blur_scheduler = CoCBlurScheduler(
                 num_train_timesteps=self.scheduler.config.num_train_timesteps,
                 focus_depth=coc_focus_depth,
+                focus_width=coc_focus_width,
                 max_radius=coc_max_radius,
                 gamma=coc_gamma,
                 schedule_power=coc_schedule_power,
+                global_blur_at_max=coc_global_blur_at_max,
+                depth_blur_strength=coc_depth_blur_strength,
+                focus_depth_min=coc_focus_depth_min,
+                focus_depth_max=coc_focus_depth_max,
+                focus_width_min=coc_focus_width_min,
+                focus_width_max=coc_focus_width_max,
+                global_blur_min=coc_global_blur_min,
+                global_blur_max=coc_global_blur_max,
             )
 
         # 6. Prepare latent variables
@@ -748,6 +766,15 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 start_steps_tensor = start_steps_tensor.long()
                 latents = self.scheduler.add_noise(latents_condition_image[0:1, ...], latents, start_steps_tensor)
     
+        coc_sample_focus_depth = None
+        coc_sample_focus_width = None
+        coc_sample_global_blur_floor = None
+        if diffusion_process == "coc_blur" and depth is not None:
+            (
+                coc_sample_focus_depth,
+                coc_sample_focus_width,
+                coc_sample_global_blur_floor,
+            ) = coc_blur_scheduler.sample_dof_params(latents)
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -930,6 +957,9 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                             depth=depth,
                             timestep=t,
                             inference_timesteps=timesteps,
+                            focus_depth=coc_sample_focus_depth,
+                            focus_width=coc_sample_focus_width,
+                            global_blur_floor=coc_sample_global_blur_floor,
                         )
                     else:
                         index = (timesteps == t).nonzero(as_tuple=False)
