@@ -166,7 +166,7 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             pad_width, pad_height = padding
             width, height = validation_image.size
             validation_depth = None
-            if args.diffusion_process == "coc_blur" and args.use_depth:
+            if args.diffusion_process in ("coc_blur", "coc_endpoint", "coc_image_latent") and args.use_depth:
                 depth_name = resolve_depth_path(args.depth_path, image_name)
                 if depth_name is None:
                     raise FileNotFoundError(f"Cannot find a depth map for `{image_name}`.")
@@ -239,16 +239,36 @@ if __name__ == "__main__":
     parser.add_argument("--conditioning_scale", type=float, default=1.0)
     parser.add_argument("--blending_alpha", type=float, default=1.0)
     parser.add_argument("--num_inference_steps", type=int, default=50)
-    parser.add_argument("--vae_decoder_tiled_size", type=int, default=224) # latent size, for 24G
-    parser.add_argument("--vae_encoder_tiled_size", type=int, default=1024) # image size, for 13G
-    parser.add_argument("--latent_tiled_size", type=int, default=96) 
-    parser.add_argument("--latent_tiled_overlap", type=int, default=4) 
+    parser.add_argument(
+        "--vae_decoder_tiled_size",
+        type=int,
+        default=0,
+        help="VAE decoder tile size. Set <=0 to disable VAE decoder tiling and avoid seam artifacts.",
+    )
+    parser.add_argument(
+        "--vae_encoder_tiled_size",
+        type=int,
+        default=0,
+        help="VAE encoder tile size. Set <=0 to disable VAE encoder tiling and avoid seam artifacts.",
+    )
+    parser.add_argument(
+        "--latent_tiled_size",
+        type=int,
+        default=256,
+        help="Latent tile area threshold. Set <=0 to disable latent tiling and avoid tile seam artifacts.",
+    )
+    parser.add_argument("--latent_tiled_overlap", type=int, default=16)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--sample_times", type=int, default=1)
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain')
     parser.add_argument("--start_steps", type=int, default=999) # defaults set to 999.
     parser.add_argument("--start_point", type=str, choices=['lr', 'noise'], default='lr') # LR Embedding Strategy, choose 'lr latent + 999 steps noise' as diffusion start point. 
-    parser.add_argument("--diffusion_process", type=str, choices=["gaussian", "coc_blur"], default="gaussian")
+    parser.add_argument(
+        "--diffusion_process",
+        type=str,
+        choices=["gaussian", "coc_blur", "paired_endpoint", "coc_endpoint", "coc_image_latent"],
+        default="gaussian",
+    )
     parser.add_argument("--coc_focus_depth", type=float, default=0.7)
     parser.add_argument("--coc_focus_width", type=float, default=0.0)
     parser.add_argument("--coc_focus_depth_min", type=float, default=0.1)
@@ -267,7 +287,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--coc_global_blur_at_max", type=float, default=0.0)
     parser.add_argument("--coc_depth_blur_strength", type=float, default=1.0)
-    parser.add_argument("--coc_inference_start", type=str, choices=["encoded_input", "gaussian_blur"], default="encoded_input")
+    parser.add_argument(
+        "--coc_inference_start",
+        type=str,
+        choices=["latent_max_blur", "encoded_input", "gaussian_blur"],
+        default="encoded_input",
+        help=(
+            "CoC inference start. encoded_input uses the source/blurred image latent directly. "
+            "latent_max_blur additionally applies full-image maximum CoC blur in latent space."
+        ),
+    )
     parser.add_argument("--use_depth", action="store_true")
     parser.add_argument("--start_blur_sigma", type=float, default=8.0)
     parser.add_argument("--start_blur_kernel_size", type=int, default=None)

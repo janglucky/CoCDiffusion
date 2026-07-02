@@ -43,7 +43,10 @@ from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from models.controlnet import ControlNetModel as LocalControlNetModel
 
 from schedulers.coc_blur_scheduler import CoCBlurScheduler
+from schedulers.coc_endpoint_scheduler import CoCEndpointScheduler
+from schedulers.coc_image_latent_scheduler import CoCImageLatentScheduler
 from schedulers.gaussian_blur_scheduler import GaussianBlurScheduler
+from schedulers.paired_endpoint_scheduler import PairedEndpointScheduler
 from utils.vaehook import VAEHook, perfcount
 
 
@@ -138,10 +141,17 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         encoder = self.vae.encoder
         decoder = self.vae.decoder
 
-        self.vae.encoder.forward = VAEHook(
-            encoder, encoder_tile_size, is_decoder=False, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
-        self.vae.decoder.forward = VAEHook(
-            decoder, decoder_tile_size, is_decoder=True, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
+        if encoder_tile_size is not None and encoder_tile_size > 0:
+            self.vae.encoder.forward = VAEHook(
+                encoder, encoder_tile_size, is_decoder=False, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
+        else:
+            self.vae.encoder.forward = self.vae.encoder.original_forward
+
+        if decoder_tile_size is not None and decoder_tile_size > 0:
+            self.vae.decoder.forward = VAEHook(
+                decoder, decoder_tile_size, is_decoder=True, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
+        else:
+            self.vae.decoder.forward = self.vae.decoder.original_forward
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.enable_vae_slicing
     def enable_vae_slicing(self):
@@ -644,10 +654,15 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         """
         if image is None:
             raise ValueError("`image` must be provided.")
-        if diffusion_process not in ("gaussian", "coc_blur"):
-            raise ValueError("`diffusion_process` must be either 'gaussian' or 'coc_blur'.")
-        if coc_inference_start not in ("encoded_input", "gaussian_blur"):
-            raise ValueError("`coc_inference_start` must be either 'encoded_input' or 'gaussian_blur'.")
+        if diffusion_process not in ("gaussian", "coc_blur", "paired_endpoint", "coc_endpoint", "coc_image_latent"):
+            raise ValueError(
+                "`diffusion_process` must be 'gaussian', 'coc_blur', 'paired_endpoint', "
+                "'coc_endpoint', or 'coc_image_latent'."
+            )
+        if coc_inference_start not in ("latent_max_blur", "encoded_input", "gaussian_blur"):
+            raise ValueError(
+                "`coc_inference_start` must be one of 'latent_max_blur', 'encoded_input', or 'gaussian_blur'."
+            )
 
         # 0. Default height and width to unet
         height, width = self._default_height_width(height, width, image)
@@ -704,6 +719,9 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
         coc_blur_scheduler = None
+        paired_endpoint_scheduler = None
+        coc_endpoint_scheduler = None
+        coc_image_latent_scheduler = None
         if diffusion_process == "coc_blur":
             coc_blur_scheduler = CoCBlurScheduler(
                 num_train_timesteps=self.scheduler.config.num_train_timesteps,
@@ -721,10 +739,77 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 global_blur_min=coc_global_blur_min,
                 global_blur_max=coc_global_blur_max,
             )
+        elif diffusion_process == "paired_endpoint":
+            paired_endpoint_scheduler = PairedEndpointScheduler(
+                num_train_timesteps=self.scheduler.config.num_train_timesteps,
+                schedule_power=coc_schedule_power,
+            )
+        elif diffusion_process == "coc_endpoint":
+            coc_endpoint_scheduler = CoCEndpointScheduler(
+                CoCBlurScheduler(
+                    num_train_timesteps=self.scheduler.config.num_train_timesteps,
+                    focus_depth=coc_focus_depth,
+                    focus_width=coc_focus_width,
+                    max_radius=coc_max_radius,
+                    gamma=coc_gamma,
+                    schedule_power=coc_schedule_power,
+                    global_blur_at_max=coc_global_blur_at_max,
+                    depth_blur_strength=coc_depth_blur_strength,
+                    focus_depth_min=coc_focus_depth_min,
+                    focus_depth_max=coc_focus_depth_max,
+                    focus_width_min=coc_focus_width_min,
+                    focus_width_max=coc_focus_width_max,
+                    global_blur_min=coc_global_blur_min,
+                    global_blur_max=coc_global_blur_max,
+                )
+            )
+        elif diffusion_process == "coc_image_latent":
+            coc_image_latent_scheduler = CoCImageLatentScheduler(
+                CoCBlurScheduler(
+                    num_train_timesteps=self.scheduler.config.num_train_timesteps,
+                    focus_depth=coc_focus_depth,
+                    focus_width=coc_focus_width,
+                    max_radius=coc_max_radius,
+                    gamma=coc_gamma,
+                    schedule_power=coc_schedule_power,
+                    global_blur_at_max=coc_global_blur_at_max,
+                    depth_blur_strength=coc_depth_blur_strength,
+                    focus_depth_min=coc_focus_depth_min,
+                    focus_depth_max=coc_focus_depth_max,
+                    focus_width_min=coc_focus_width_min,
+                    focus_width_max=coc_focus_width_max,
+                    global_blur_min=coc_global_blur_min,
+                    global_blur_max=coc_global_blur_max,
+                )
+            )
+
+        vae_dtype = next(self.vae.parameters()).dtype
+
+        def encode_image_to_latents(image_tensor):
+            image_tensor = image_tensor.to(device=device, dtype=vae_dtype)
+            encoded_latents = self.vae.encode(image_tensor).latent_dist.sample()
+            return (encoded_latents * self.vae.config.scaling_factor).to(dtype=controlnet.dtype)
+
+        def decode_latents_to_image(latents_tensor):
+            latents_tensor = (latents_tensor / self.vae.config.scaling_factor).to(dtype=vae_dtype)
+            decoded_image = self.vae.decode(latents_tensor, return_dict=False)[0]
+            return decoded_image.to(dtype=controlnet.dtype)
 
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
-        if diffusion_process == "coc_blur":
+        paired_degraded_endpoint_latents = None
+        coc_endpoint_degraded_latents = None
+        if diffusion_process == "paired_endpoint":
+            paired_degraded_endpoint_latents = self.vae.encode(image * 2 - 1).latent_dist.sample()
+            paired_degraded_endpoint_latents = paired_degraded_endpoint_latents * self.vae.config.scaling_factor
+            latents = paired_degraded_endpoint_latents
+        elif diffusion_process == "coc_endpoint":
+            coc_endpoint_degraded_latents = self.vae.encode(image * 2 - 1).latent_dist.sample()
+            coc_endpoint_degraded_latents = coc_endpoint_degraded_latents * self.vae.config.scaling_factor
+            latents = coc_endpoint_degraded_latents
+        elif diffusion_process == "coc_image_latent":
+            latents = encode_image_to_latents(image * 2 - 1)
+        elif diffusion_process == "coc_blur":
             if coc_inference_start == "gaussian_blur":
                 blur_scheduler = GaussianBlurScheduler(
                     num_train_timesteps=self.scheduler.config.num_train_timesteps,
@@ -739,11 +824,31 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                     dtype=torch.long,
                 )
                 image_for_start = blur_scheduler.add_blur(image, last_timestep)
+                latents = self.vae.encode(image_for_start * 2 - 1).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
             else:
-                image_for_start = image
-
-            latents = self.vae.encode(image_for_start * 2 - 1).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
+                latents = self.vae.encode(image * 2 - 1).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
+                if coc_inference_start == "latent_max_blur":
+                    max_blur_timestep = torch.full(
+                        (latents.shape[0],),
+                        self.scheduler.config.num_train_timesteps - 1,
+                        device=latents.device,
+                        dtype=torch.long,
+                    )
+                    full_blur_depth = torch.zeros(
+                        (latents.shape[0], 1, latents.shape[-2], latents.shape[-1]),
+                        device=latents.device,
+                        dtype=latents.dtype,
+                    )
+                    latents = coc_blur_scheduler.add_blur(
+                        latents,
+                        full_blur_depth,
+                        max_blur_timestep,
+                        focus_depth=0.5,
+                        focus_width=0.0,
+                        global_blur_floor=1.0,
+                    )
         else:
             latents = self.prepare_latents(
                 batch_size * num_images_per_input,
@@ -769,12 +874,29 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         coc_sample_focus_depth = None
         coc_sample_focus_width = None
         coc_sample_global_blur_floor = None
-        if diffusion_process == "coc_blur" and depth is not None:
-            (
-                coc_sample_focus_depth,
-                coc_sample_focus_width,
-                coc_sample_global_blur_floor,
-            ) = coc_blur_scheduler.sample_dof_params(latents)
+        if diffusion_process in ("coc_blur", "coc_endpoint", "coc_image_latent") and depth is not None:
+            if diffusion_process == "coc_blur" and coc_inference_start == "latent_max_blur":
+                coc_sample_focus_depth = torch.full(
+                    (latents.shape[0],), 0.5, device=latents.device, dtype=latents.dtype
+                )
+                coc_sample_focus_width = torch.zeros(
+                    (latents.shape[0],), device=latents.device, dtype=latents.dtype
+                )
+                coc_sample_global_blur_floor = torch.ones(
+                    (latents.shape[0],), device=latents.device, dtype=latents.dtype
+                )
+            else:
+                if diffusion_process == "coc_blur":
+                    dof_scheduler = coc_blur_scheduler
+                elif diffusion_process == "coc_endpoint":
+                    dof_scheduler = coc_endpoint_scheduler
+                else:
+                    dof_scheduler = coc_image_latent_scheduler
+                (
+                    coc_sample_focus_depth,
+                    coc_sample_focus_width,
+                    coc_sample_global_blur_floor,
+                ) = dof_scheduler.sample_dof_params(latents)
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -786,8 +908,11 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             
             _, _, h, w = latents.size()
             tile_size, tile_overlap = (latent_tiled_size, latent_tiled_overlap) if args is not None else (256, 8)
-            if h*w<=tile_size*tile_size:
-                print(f"[Tiled Latent]: the input size is tiny and unnecessary to tile.")
+            use_latent_tiling = tile_size is not None and tile_size > 0 and h * w > tile_size * tile_size
+            if tile_size is None or tile_size <= 0:
+                print("[Tiled Latent]: disabled, using full latent inference.")
+            elif not use_latent_tiling:
+                print("[Tiled Latent]: the input size is tiny and unnecessary to tile.")
             else:
                 print(f"[Tiled Latent]: the input size is {image.shape[-2]}x{image.shape[-1]}, need to tiled")
 
@@ -806,7 +931,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 # controlnet(s) inference
                 controlnet_latent_model_input = latent_model_input
 
-                if h*w<=tile_size*tile_size: # tiled latent input
+                if not use_latent_tiling:
                     down_block_res_samples, mid_block_res_sample = [None]*10, None
                     down_block_res_samples, mid_block_res_sample = self.controlnet(
                         controlnet_latent_model_input,
@@ -949,7 +1074,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 if diffusion_process == "gaussian":
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                else:
+                elif diffusion_process == "coc_blur":
                     if depth is not None:
                         latents = coc_blur_scheduler.step(
                             predicted_clean=noise_pred,
@@ -973,6 +1098,39 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                         step_fraction = (current_strength - prev_strength) / max(current_strength, 1e-6)
                         step_fraction = min(max(step_fraction * float(update_blend), 0.0), 1.0)
                         latents = (1.0 - step_fraction) * latents + step_fraction * noise_pred
+                elif diffusion_process == "paired_endpoint":
+                    latents = paired_endpoint_scheduler.step(
+                        predicted_clean=noise_pred,
+                        sample=latents,
+                        degraded_endpoint=paired_degraded_endpoint_latents,
+                        timestep=t,
+                        inference_timesteps=timesteps,
+                    )
+                elif diffusion_process == "coc_endpoint":
+                    latents = coc_endpoint_scheduler.step(
+                        predicted_clean=noise_pred,
+                        sample=latents,
+                        degraded_endpoint=coc_endpoint_degraded_latents,
+                        depth=depth,
+                        timestep=t,
+                        inference_timesteps=timesteps,
+                        focus_depth=coc_sample_focus_depth,
+                        focus_width=coc_sample_focus_width,
+                        global_blur_floor=coc_sample_global_blur_floor,
+                    )
+                else:
+                    latents = coc_image_latent_scheduler.step(
+                        predicted_clean=noise_pred,
+                        sample=latents,
+                        depth=depth,
+                        timestep=t,
+                        inference_timesteps=timesteps,
+                        decode_latents_to_image=decode_latents_to_image,
+                        encode_image_to_latents=encode_image_to_latents,
+                        focus_depth=coc_sample_focus_depth,
+                        focus_width=coc_sample_focus_width,
+                        global_blur_floor=coc_sample_global_blur_floor,
+                    )
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):

@@ -5,6 +5,7 @@
 '''
 
 import argparse
+import fnmatch
 import logging
 import math
 import os
@@ -35,6 +36,9 @@ from diffusers.utils.import_utils import is_xformers_available
 from dataloaders.paired_dataset import PairedImageDataset
 from dataloaders.triplet_dataset import TripletImageDataset
 from schedulers.coc_blur_scheduler import CoCBlurScheduler
+from schedulers.coc_endpoint_scheduler import CoCEndpointScheduler
+from schedulers.coc_image_latent_scheduler import CoCImageLatentScheduler
+from schedulers.paired_endpoint_scheduler import PairedEndpointScheduler
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.21.0.dev0")
@@ -372,11 +376,63 @@ def parse_args(input_args=None):
     parser.add_argument("--root_folders",  type=str , default='' )
     parser.add_argument('--trainable_modules', nargs='*', type=str, default=["controlnet"])
     parser.add_argument(
+        "--unet_train_preset",
+        type=str,
+        choices=[
+            "none",
+            "controlnet_interaction_light",
+            "controlnet_interaction",
+            "controlnet_interaction_full",
+            "controlnet_consumer_light",
+            "controlnet_consumer",
+            "controlnet_consumer_full",
+            "mid_up",
+            "all",
+        ],
+        default="none",
+        help=(
+            "Optional UNet fine-tuning preset. The controlnet_interaction presets unfreeze "
+            "only the residual-output layers at ControlNet injection sites, while the "
+            "controlnet_consumer presets unfreeze UNet up/output layers that consume those residuals."
+        ),
+    )
+    parser.add_argument(
+        "--unet_trainable_modules",
+        nargs="*",
+        default=None,
+        help=(
+            "Additional UNet parameter name prefixes or fnmatch patterns to unfreeze, e.g. "
+            "`up_blocks.3 conv_out down_blocks.*.resnets.*.conv2*`. "
+            "These are applied on top of --unet_train_preset."
+        ),
+    )
+    parser.add_argument(
+        "--unet_learning_rate",
+        type=float,
+        default=1e-6,
+        help="Learning rate for selectively unfrozen UNet parameters.",
+    )
+    parser.add_argument(
         "--diffusion_process",
         type=str,
-        choices=["gaussian", "coc_blur"],
+        choices=["gaussian", "coc_blur", "paired_endpoint", "coc_endpoint", "coc_image_latent"],
         default="gaussian",
-        help="Use the original Gaussian diffusion or CoC blur cold-diffusion process.",
+        help=(
+            "Use the original Gaussian diffusion, CoC blur cold-diffusion process, "
+            "paired-endpoint cold diffusion, CoC-guided paired-endpoint cold diffusion, "
+            "or image-space CoC blur mixed in latent space."
+        ),
+    )
+    parser.add_argument(
+        "--coc_train_input_mode",
+        type=str,
+        choices=["clean_blur", "conditioning", "conditioning_blur"],
+        default="clean_blur",
+        help=(
+            "CoC training input source. clean_blur uses the old clean-target latent plus synthetic CoC blur. "
+            "conditioning uses the source/blurred image latent directly to match encoded_input inference. "
+            "conditioning_blur additionally applies synthetic CoC blur on the source latent."
+        ),
     )
     parser.add_argument("--coc_focus_depth", type=float, default=0.7)
     parser.add_argument(
@@ -459,10 +515,74 @@ def resolve_timestep_conditioning(args):
     return args.diffusion_process == "gaussian"
 
 
+UNET_TRAIN_PRESETS = {
+    "none": [],
+    # These layers directly produce the residual tensors that receive ControlNet additions.
+    "controlnet_interaction_light": [
+        "mid_block.resnets.1.conv2*",
+        "mid_block.resnets.1.conv_shortcut*",
+    ],
+    "controlnet_interaction": [
+        "down_blocks.2.resnets.*.conv2*",
+        "down_blocks.2.resnets.*.conv_shortcut*",
+        "down_blocks.2.downsamplers.*.conv*",
+        "down_blocks.3.resnets.*.conv2*",
+        "down_blocks.3.resnets.*.conv_shortcut*",
+        "down_blocks.3.downsamplers.*.conv*",
+        "mid_block.resnets.1.conv2*",
+        "mid_block.resnets.1.conv_shortcut*",
+    ],
+    "controlnet_interaction_full": [
+        "conv_in*",
+        "down_blocks.*.resnets.*.conv2*",
+        "down_blocks.*.resnets.*.conv_shortcut*",
+        "down_blocks.*.downsamplers.*.conv*",
+        "mid_block.resnets.1.conv2*",
+        "mid_block.resnets.1.conv_shortcut*",
+    ],
+    "controlnet_consumer_light": ["up_blocks.3", "conv_norm_out", "conv_out"],
+    "controlnet_consumer": ["up_blocks.2", "up_blocks.3", "conv_norm_out", "conv_out"],
+    "controlnet_consumer_full": ["up_blocks", "conv_norm_out", "conv_out"],
+    "mid_up": ["mid_block.resnets.1.conv2*", "up_blocks.2", "up_blocks.3", "conv_norm_out", "conv_out"],
+    "all": [""],
+}
+
+
+def resolve_unet_trainable_patterns(args):
+    patterns = list(UNET_TRAIN_PRESETS[args.unet_train_preset])
+    if args.unet_trainable_modules:
+        patterns.extend(args.unet_trainable_modules)
+
+    unique_patterns = []
+    for pattern in patterns:
+        pattern = pattern.strip()
+        if pattern not in unique_patterns:
+            unique_patterns.append(pattern)
+    return unique_patterns
+
+
+def matches_unet_trainable_pattern(name, pattern):
+    return pattern == "" or name.startswith(pattern) or fnmatch.fnmatch(name, pattern)
+
+
+def unfreeze_unet_by_pattern(unet, patterns):
+    trainable_names = []
+    if not patterns:
+        return trainable_names
+
+    for name, param in unet.named_parameters():
+        if any(matches_unet_trainable_pattern(name, pattern) for pattern in patterns):
+            param.requires_grad_(True)
+            trainable_names.append(name)
+    return trainable_names
+
+
 # def main(args):
 args = parse_args()
 logging_dir = Path(args.output_dir, args.logging_dir)
 use_timestep_conditioning = resolve_timestep_conditioning(args)
+if args.coc_train_input_mode != "clean_blur" and args.diffusion_process != "coc_blur":
+    raise ValueError("`--coc_train_input_mode` only applies when `--diffusion_process coc_blur`.")
 
 
 from accelerate import DistributedDataParallelKwargs
@@ -507,6 +627,9 @@ if accelerator.is_main_process:
 # Load scheduler and models
 noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 coc_blur_scheduler = None
+paired_endpoint_scheduler = None
+coc_endpoint_scheduler = None
+coc_image_latent_scheduler = None
 if args.diffusion_process == "coc_blur":
     coc_blur_scheduler = CoCBlurScheduler(
         num_train_timesteps=noise_scheduler.config.num_train_timesteps,
@@ -523,6 +646,49 @@ if args.diffusion_process == "coc_blur":
         focus_width_max=args.coc_focus_width_max,
         global_blur_min=args.coc_global_blur_min,
         global_blur_max=args.coc_global_blur_max,
+    )
+elif args.diffusion_process == "paired_endpoint":
+    paired_endpoint_scheduler = PairedEndpointScheduler(
+        num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+        schedule_power=args.coc_schedule_power,
+    )
+elif args.diffusion_process == "coc_endpoint":
+    coc_endpoint_scheduler = CoCEndpointScheduler(
+        CoCBlurScheduler(
+            num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+            focus_depth=args.coc_focus_depth,
+            focus_width=args.coc_focus_width,
+            max_radius=args.coc_max_radius,
+            gamma=args.coc_gamma,
+            schedule_power=args.coc_schedule_power,
+            global_blur_at_max=args.coc_global_blur_at_max,
+            depth_blur_strength=args.coc_depth_blur_strength,
+            focus_depth_min=args.coc_focus_depth_min,
+            focus_depth_max=args.coc_focus_depth_max,
+            focus_width_min=args.coc_focus_width_min,
+            focus_width_max=args.coc_focus_width_max,
+            global_blur_min=args.coc_global_blur_min,
+            global_blur_max=args.coc_global_blur_max,
+        )
+    )
+elif args.diffusion_process == "coc_image_latent":
+    coc_image_latent_scheduler = CoCImageLatentScheduler(
+        CoCBlurScheduler(
+            num_train_timesteps=noise_scheduler.config.num_train_timesteps,
+            focus_depth=args.coc_focus_depth,
+            focus_width=args.coc_focus_width,
+            max_radius=args.coc_max_radius,
+            gamma=args.coc_gamma,
+            schedule_power=args.coc_schedule_power,
+            global_blur_at_max=args.coc_global_blur_at_max,
+            depth_blur_strength=args.coc_depth_blur_strength,
+            focus_depth_min=args.coc_focus_depth_min,
+            focus_depth_max=args.coc_focus_depth_max,
+            focus_width_min=args.coc_focus_width_min,
+            focus_width_max=args.coc_focus_width_max,
+            global_blur_min=args.coc_global_blur_min,
+            global_blur_max=args.coc_global_blur_max,
+        )
     )
 vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
 # unet = UNet2DConditionModel.from_pretrained(
@@ -620,6 +786,19 @@ if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
 
 vae.requires_grad_(False)
 unet.requires_grad_(False)
+unet_trainable_patterns = resolve_unet_trainable_patterns(args)
+unet_trainable_names = unfreeze_unet_by_pattern(unet, unet_trainable_patterns)
+if unet_trainable_names:
+    unet.train()
+    logger.info(
+        "Unfroze %d UNet parameters with patterns: %s",
+        len(unet_trainable_names),
+        ", ".join(unet_trainable_patterns),
+    )
+    logger.info("Trainable UNet parameter names: %s", ", ".join(unet_trainable_names))
+else:
+    unet.eval()
+    logger.info("UNet remains fully frozen.")
 controlnet.train()
 controlnet.requires_grad_(True)
 
@@ -663,9 +842,11 @@ if args.allow_tf32:
     torch.backends.cuda.matmul.allow_tf32 = True
 
 if args.scale_lr:
+    lr_scale = args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
     args.learning_rate = (
-        args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        args.learning_rate * lr_scale
     )
+    args.unet_learning_rate = args.unet_learning_rate * lr_scale
 
 # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
 if args.use_8bit_adam:
@@ -681,8 +862,19 @@ else:
     optimizer_class = torch.optim.AdamW
 
 # Optimizer creation
-print(f'=================Optimize ControlNet and Unet ======================')
-params_to_optimize = [p for p in list(controlnet.parameters()) + list(unet.parameters()) if p.requires_grad]
+controlnet_params_to_optimize = [p for p in controlnet.parameters() if p.requires_grad]
+unet_params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
+params_to_optimize = [{"params": controlnet_params_to_optimize, "lr": args.learning_rate}]
+if unet_params_to_optimize:
+    params_to_optimize.append({"params": unet_params_to_optimize, "lr": args.unet_learning_rate})
+
+print(
+    "================= Optimize ControlNet"
+    + (" and selected UNet layers" if unet_params_to_optimize else "")
+    + " ======================"
+)
+logger.info("Trainable ControlNet parameter tensors: %d", len(controlnet_params_to_optimize))
+logger.info("Trainable UNet parameter tensors: %d", len(unet_params_to_optimize))
 
 
 print(f'start to load optimizer...')
@@ -695,7 +887,7 @@ optimizer = optimizer_class(
     eps=args.adam_epsilon,
 )
 
-if args.diffusion_process == "coc_blur":
+if args.diffusion_process in ("coc_blur", "coc_endpoint", "coc_image_latent"):
     train_dataset = TripletImageDataset(root_folders=args.root_folders)
 else:
     train_dataset = PairedImageDataset(root_folders=args.root_folders)
@@ -814,11 +1006,18 @@ progress_bar = tqdm(
 )
 
 
+def encode_image_to_latents(image):
+    image = image.to(device=accelerator.device, dtype=weight_dtype)
+    encoded_latents = vae.encode(image).latent_dist.sample()
+    return encoded_latents * vae.config.scaling_factor
+
+
 for epoch in range(first_epoch, args.num_train_epochs):
     for step, batch in enumerate(train_dataloader):
         # with accelerator.accumulate(controlnet):
         with accelerator.accumulate(controlnet), accelerator.accumulate(unet):
             pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+            controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
             # Convert images to latent space
             latents = vae.encode(pixel_values).latent_dist.sample()
             latents = latents * vae.config.scaling_factor
@@ -832,12 +1031,46 @@ for epoch in range(first_epoch, args.num_train_epochs):
                 # Original forward diffusion process.
                 noise = torch.randn_like(latents)
                 model_input_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            else:
+            elif args.diffusion_process == "coc_blur":
                 depth = batch["depth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
-                model_input_latents = coc_blur_scheduler.add_blur(latents, depth, timesteps)
+                if args.coc_train_input_mode == "clean_blur":
+                    model_input_latents = coc_blur_scheduler.add_blur(latents, depth, timesteps)
+                else:
+                    conditioning_latents = vae.encode(controlnet_image * 2.0 - 1.0).latent_dist.sample()
+                    conditioning_latents = conditioning_latents * vae.config.scaling_factor
+                    if args.coc_train_input_mode == "conditioning":
+                        model_input_latents = conditioning_latents
+                    else:
+                        model_input_latents = coc_blur_scheduler.add_blur(conditioning_latents, depth, timesteps)
+            elif args.diffusion_process == "coc_endpoint":
+                depth = batch["depth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                degraded_endpoint_latents = vae.encode(controlnet_image * 2.0 - 1.0).latent_dist.sample()
+                degraded_endpoint_latents = degraded_endpoint_latents * vae.config.scaling_factor
+                model_input_latents = coc_endpoint_scheduler.add_degradation(
+                    latents,
+                    degraded_endpoint_latents,
+                    depth,
+                    timesteps,
+                )
+            elif args.diffusion_process == "coc_image_latent":
+                depth = batch["depth_pixel_values"].to(accelerator.device, dtype=weight_dtype)
+                with torch.no_grad():
+                    model_input_latents = coc_image_latent_scheduler.add_degradation(
+                        pixel_values,
+                        latents,
+                        depth,
+                        timesteps,
+                        encode_image_to_latents,
+                    )
+            else:
+                degraded_endpoint_latents = vae.encode(controlnet_image * 2.0 - 1.0).latent_dist.sample()
+                degraded_endpoint_latents = degraded_endpoint_latents * vae.config.scaling_factor
+                model_input_latents = paired_endpoint_scheduler.add_degradation(
+                    latents,
+                    degraded_endpoint_latents,
+                    timesteps,
+                )
             model_timesteps = timesteps if use_timestep_conditioning else None
-
-            controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
 
             down_block_res_samples, mid_block_res_sample = controlnet(
                 model_input_latents,
@@ -866,7 +1099,8 @@ for epoch in range(first_epoch, args.num_train_epochs):
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
             else:
                 target = latents
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            latent_loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            loss = latent_loss
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -889,8 +1123,23 @@ for epoch in range(first_epoch, args.num_train_epochs):
                     accelerator.save_state(save_path)
                     logger.info(f"Saved state to {save_path}")
 
-        logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-        progress_bar.set_postfix(**logs)
+        last_lrs = lr_scheduler.get_last_lr()
+        total_loss_value = loss.detach().item()
+        latent_loss_value = latent_loss.detach().item()
+        logs = {
+            "loss": total_loss_value,
+            "total_loss": total_loss_value,
+            "latent_loss": latent_loss_value,
+            "latent_loss_weighted": latent_loss_value,
+            "lr": last_lrs[0],
+        }
+        if len(last_lrs) > 1:
+            logs["unet_lr"] = last_lrs[1]
+        progress_bar.set_postfix(
+            loss=total_loss_value,
+            latent=latent_loss_value,
+            lr=last_lrs[0],
+        )
         accelerator.log(logs, step=global_step)
 
         if global_step >= args.max_train_steps:

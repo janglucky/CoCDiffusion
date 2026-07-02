@@ -10,9 +10,14 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 PRETRAINED_MODEL_PATH="${PRETRAINED_MODEL_PATH:-/home/gd09385/models/stable-diffusion-2-base}"
 SEESR_MODEL_PATH="${SEESR_MODEL_PATH:-/home/gd09385/models/seesr}"
 ROOT_FOLDERS="${ROOT_FOLDERS:-/home/gd09385/data/test_c_sub}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_blur_cured}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_image_latent}"
 MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+UNET_LEARNING_RATE="${UNET_LEARNING_RATE:-1e-6}"
+UNET_TRAIN_PRESET="${UNET_TRAIN_PRESET:-controlnet_interaction_full}"
+UNET_TRAINABLE_MODULES="${UNET_TRAINABLE_MODULES:-}"
+COC_TRAIN_INPUT_MODE="${COC_TRAIN_INPUT_MODE:-conditioning}"
+DIFFUSION_PROCESS="${DIFFUSION_PROCESS:-coc_image_latent}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
@@ -43,11 +48,13 @@ cmd=(
   --enable_xformers_memory_efficient_attention
   --mixed_precision "${MIXED_PRECISION}"
   --learning_rate "${LEARNING_RATE}"
+  --unet_learning_rate "${UNET_LEARNING_RATE}"
+  --unet_train_preset "${UNET_TRAIN_PRESET}"
   --train_batch_size "${TRAIN_BATCH_SIZE}"
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
   --checkpointing_steps "${CHECKPOINTING_STEPS}"
-  --diffusion_process coc_blur
+  --diffusion_process "${DIFFUSION_PROCESS}"
   --coc_focus_depth "${COC_FOCUS_DEPTH}"
   --coc_focus_width "${COC_FOCUS_WIDTH}"
   --coc_focus_depth_min "${COC_FOCUS_DEPTH_MIN}"
@@ -63,6 +70,15 @@ cmd=(
   --coc_depth_blur_strength "${COC_DEPTH_BLUR_STRENGTH}"
   --timestep_conditioning off
 )
+
+if [[ "${DIFFUSION_PROCESS}" == "coc_blur" ]]; then
+  cmd+=(--coc_train_input_mode "${COC_TRAIN_INPUT_MODE}")
+fi
+
+if [[ -n "${UNET_TRAINABLE_MODULES}" ]]; then
+  read -r -a UNET_TRAINABLE_MODULE_ARRAY <<< "${UNET_TRAINABLE_MODULES}"
+  cmd+=(--unet_trainable_modules "${UNET_TRAINABLE_MODULE_ARRAY[@]}")
+fi
 
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
