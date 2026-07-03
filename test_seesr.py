@@ -166,7 +166,11 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
             pad_width, pad_height = padding
             width, height = validation_image.size
             validation_depth = None
-            if args.diffusion_process in ("coc_blur", "coc_endpoint") and args.use_depth:
+            needs_coc_depth = args.diffusion_process in ("coc_blur", "coc_endpoint") or (
+                args.diffusion_process == "coc_image_latent"
+                and args.coc_image_latent_reverse == "recompute_prev"
+            )
+            if needs_coc_depth and args.use_depth:
                 depth_name = resolve_depth_path(args.depth_path, image_name)
                 if depth_name is None:
                     raise FileNotFoundError(f"Cannot find a depth map for `{image_name}`.")
@@ -207,9 +211,15 @@ def main(args, enable_xformers_memory_efficient_attention=True,):
                             coc_global_blur_at_max=args.coc_global_blur_at_max,
                             coc_depth_blur_strength=args.coc_depth_blur_strength,
                             coc_inference_start=args.coc_inference_start,
+                            coc_image_latent_reverse=args.coc_image_latent_reverse,
+                            coc_image_latent_timestep_spacing=args.coc_image_latent_timestep_spacing,
+                            coc_image_latent_normalize_start=args.coc_image_latent_normalize_start,
+                            coc_noise_normalization=args.coc_noise_normalization,
+                            coc_noise_normalization_eps=args.coc_noise_normalization_eps,
                             start_blur_sigma=args.start_blur_sigma,
                             start_blur_kernel_size=args.start_blur_kernel_size,
                             update_blend=args.update_blend,
+                            start_steps=args.start_steps,
                             args=args,
                         ).images[0]
                 
@@ -287,6 +297,41 @@ if __name__ == "__main__":
     )
     parser.add_argument("--coc_global_blur_at_max", type=float, default=0.0)
     parser.add_argument("--coc_depth_blur_strength", type=float, default=1.0)
+    parser.add_argument(
+        "--coc_image_latent_reverse",
+        type=str,
+        choices=["scheduler", "recompute_prev", "source_endpoint"],
+        default="scheduler",
+        help=(
+            "Reverse process for coc_image_latent. scheduler uses the official scheduler.step. "
+            "recompute_prev estimates clean latent first, then rebuilds the previous CoC blur latent; "
+            "it requires --use_depth to take effect. source_endpoint anchors the reverse trajectory to "
+            "the observed source latent and does not require depth."
+        ),
+    )
+    parser.add_argument(
+        "--coc_image_latent_timestep_spacing",
+        type=str,
+        choices=["scheduler", "full_range"],
+        default="scheduler",
+        help=(
+            "Timestep schedule for coc_image_latent inference. scheduler keeps diffusers defaults; "
+            "full_range uses [T-1 ... 0], so one-step inference really starts from the strongest degradation."
+        ),
+    )
+    parser.add_argument(
+        "--coc_image_latent_normalize_start",
+        action="store_true",
+        help="Enable sample-wise normalization for the initial source latent in coc_image_latent inference.",
+    )
+    parser.add_argument(
+        "--coc_noise_normalization",
+        type=str,
+        choices=["none", "sample"],
+        default="sample",
+        help="Normalization mode used when recomputing CoC blur latents during inference.",
+    )
+    parser.add_argument("--coc_noise_normalization_eps", type=float, default=1e-6)
     parser.add_argument(
         "--coc_inference_start",
         type=str,

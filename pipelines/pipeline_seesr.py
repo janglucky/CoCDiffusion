@@ -42,6 +42,7 @@ from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 
 from models.controlnet import ControlNetModel as LocalControlNetModel
 
+from coc import add_coc_blur, sample_coc_dof_params
 from schedulers.coc_blur_scheduler import CoCBlurScheduler
 from schedulers.coc_endpoint_scheduler import CoCEndpointScheduler
 from schedulers.gaussian_blur_scheduler import GaussianBlurScheduler
@@ -585,6 +586,11 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         coc_global_blur_at_max=0.0,
         coc_depth_blur_strength=1.0,
         coc_inference_start="encoded_input",
+        coc_image_latent_reverse="scheduler",
+        coc_image_latent_timestep_spacing="scheduler",
+        coc_image_latent_normalize_start=False,
+        coc_noise_normalization="sample",
+        coc_noise_normalization_eps=1e-6,
         start_blur_sigma=8.0,
         start_blur_kernel_size=None,
         update_blend=1.0,
@@ -662,6 +668,14 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             raise ValueError(
                 "`coc_inference_start` must be one of 'latent_max_blur', 'encoded_input', or 'gaussian_blur'."
             )
+        if coc_image_latent_reverse not in ("scheduler", "recompute_prev", "source_endpoint"):
+            raise ValueError(
+                "`coc_image_latent_reverse` must be 'scheduler', 'recompute_prev', or 'source_endpoint'."
+            )
+        if coc_image_latent_timestep_spacing not in ("scheduler", "full_range"):
+            raise ValueError("`coc_image_latent_timestep_spacing` must be either 'scheduler' or 'full_range'.")
+        if coc_noise_normalization not in ("none", "sample"):
+            raise ValueError("`coc_noise_normalization` must be either 'none' or 'sample'.")
 
         # 0. Default height and width to unet
         height, width = self._default_height_width(height, width, image)
@@ -717,6 +731,19 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         # no-time models receive None instead of the explicit timestep embedding.
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
+        if diffusion_process == "coc_image_latent" and coc_image_latent_timestep_spacing == "full_range":
+            train_timesteps = int(self.scheduler.config.num_train_timesteps)
+            if num_inference_steps <= 1:
+                timesteps = torch.tensor([train_timesteps - 1], device=device, dtype=torch.long)
+            else:
+                timesteps = torch.linspace(
+                    train_timesteps - 1,
+                    0,
+                    num_inference_steps,
+                    device=device,
+                    dtype=torch.float32,
+                ).round().long()
+            self.scheduler.timesteps = timesteps
         coc_blur_scheduler = None
         paired_endpoint_scheduler = None
         coc_endpoint_scheduler = None
@@ -769,10 +796,67 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             encoded_latents = self.vae.encode(image_tensor).latent_dist.sample()
             return (encoded_latents * self.vae.config.scaling_factor).to(dtype=controlnet.dtype)
 
+        def decode_latents_to_image(latents_tensor):
+            latents_tensor = (latents_tensor / self.vae.config.scaling_factor).to(dtype=vae_dtype)
+            decoded_image = self.vae.decode(latents_tensor, return_dict=False)[0]
+            return decoded_image.to(dtype=controlnet.dtype).clamp(-1.0, 1.0)
+
+        def normalize_coc_noise_latents(noise_tensor):
+            if coc_noise_normalization == "none":
+                return noise_tensor
+            noise_float = noise_tensor.float()
+            mean = noise_float.mean(dim=(1, 2, 3), keepdim=True)
+            variance = (noise_float - mean).pow(2).mean(dim=(1, 2, 3), keepdim=True)
+            normalized = (noise_float - mean) * torch.rsqrt(variance + float(coc_noise_normalization_eps))
+            return normalized.to(dtype=noise_tensor.dtype)
+
+        def alpha_prod_for_timestep(timestep_value, sample):
+            if timestep_value < 0:
+                return torch.ones((1, 1, 1, 1), device=sample.device, dtype=sample.dtype)
+            alpha = self.scheduler.alphas_cumprod[int(timestep_value)]
+            return alpha.to(device=sample.device, dtype=sample.dtype).view(1, 1, 1, 1)
+
+        def previous_timestep_from_schedule(timestep):
+            timestep_value = int(timestep.item() if isinstance(timestep, torch.Tensor) else timestep)
+            matches = (timesteps == timestep_value).nonzero(as_tuple=False)
+            if len(matches) == 0:
+                if hasattr(self.scheduler, "previous_timestep"):
+                    prev_timestep = self.scheduler.previous_timestep(timestep_value)
+                    return int(prev_timestep.item() if isinstance(prev_timestep, torch.Tensor) else prev_timestep)
+                raise ValueError(f"Timestep {timestep_value} is not present in the active inference schedule.")
+
+            timestep_index = int(matches[0].item())
+            if timestep_index + 1 >= len(timesteps):
+                return -1
+            return int(timesteps[timestep_index + 1].item())
+
+        def predict_original_sample(model_output, timestep, sample):
+            timestep_value = int(timestep.item() if isinstance(timestep, torch.Tensor) else timestep)
+            alpha_prod_t = alpha_prod_for_timestep(timestep_value, sample)
+            beta_prod_t = 1.0 - alpha_prod_t
+            prediction_type = getattr(self.scheduler.config, "prediction_type", "epsilon")
+
+            if prediction_type == "epsilon":
+                pred_original_sample = (sample - beta_prod_t.sqrt() * model_output) / alpha_prod_t.sqrt()
+            elif prediction_type == "sample":
+                pred_original_sample = model_output
+            elif prediction_type == "v_prediction":
+                pred_original_sample = alpha_prod_t.sqrt() * sample - beta_prod_t.sqrt() * model_output
+            else:
+                raise ValueError(f"Unknown scheduler prediction_type: {prediction_type}")
+
+            if getattr(self.scheduler.config, "thresholding", False):
+                pred_original_sample = self.scheduler._threshold_sample(pred_original_sample)
+            elif getattr(self.scheduler.config, "clip_sample", False):
+                clip_range = getattr(self.scheduler.config, "clip_sample_range", 1.0)
+                pred_original_sample = pred_original_sample.clamp(-clip_range, clip_range)
+            return pred_original_sample
+
         # 6. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         paired_degraded_endpoint_latents = None
         coc_endpoint_degraded_latents = None
+        coc_image_latent_endpoint_latents = None
         if diffusion_process == "paired_endpoint":
             paired_degraded_endpoint_latents = self.vae.encode(image * 2 - 1).latent_dist.sample()
             paired_degraded_endpoint_latents = paired_degraded_endpoint_latents * self.vae.config.scaling_factor
@@ -783,6 +867,9 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             latents = coc_endpoint_degraded_latents
         elif diffusion_process == "coc_image_latent":
             latents = encode_image_to_latents(image * 2 - 1)
+            if coc_image_latent_normalize_start:
+                latents = normalize_coc_noise_latents(latents)
+            coc_image_latent_endpoint_latents = latents
         elif diffusion_process == "coc_blur":
             if coc_inference_start == "gaussian_blur":
                 blur_scheduler = GaussianBlurScheduler(
@@ -848,7 +935,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         coc_sample_focus_depth = None
         coc_sample_focus_width = None
         coc_sample_global_blur_floor = None
-        if diffusion_process in ("coc_blur", "coc_endpoint") and depth is not None:
+        if diffusion_process in ("coc_blur", "coc_endpoint", "coc_image_latent") and depth is not None:
             if diffusion_process == "coc_blur" and coc_inference_start == "latent_max_blur":
                 coc_sample_focus_depth = torch.full(
                     (latents.shape[0],), 0.5, device=latents.device, dtype=latents.dtype
@@ -862,13 +949,90 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             else:
                 if diffusion_process == "coc_blur":
                     dof_scheduler = coc_blur_scheduler
-                else:
+                elif diffusion_process == "coc_endpoint":
                     dof_scheduler = coc_endpoint_scheduler
-                (
-                    coc_sample_focus_depth,
-                    coc_sample_focus_width,
-                    coc_sample_global_blur_floor,
-                ) = dof_scheduler.sample_dof_params(latents)
+                if diffusion_process in ("coc_blur", "coc_endpoint"):
+                    (
+                        coc_sample_focus_depth,
+                        coc_sample_focus_width,
+                        coc_sample_global_blur_floor,
+                    ) = dof_scheduler.sample_dof_params(latents)
+                else:
+                    (
+                        coc_sample_focus_depth,
+                        coc_sample_focus_width,
+                        coc_sample_global_blur_floor,
+                    ) = sample_coc_dof_params(
+                        latents,
+                        focus_depth=coc_focus_depth,
+                        focus_width=coc_focus_width,
+                        global_blur_at_max=coc_global_blur_at_max,
+                        focus_depth_min=coc_focus_depth_min,
+                        focus_depth_max=coc_focus_depth_max,
+                        focus_width_min=coc_focus_width_min,
+                        focus_width_max=coc_focus_width_max,
+                        global_blur_min=coc_global_blur_min,
+                        global_blur_max=coc_global_blur_max,
+                    )
+
+        use_coc_image_latent_recompute = (
+            diffusion_process == "coc_image_latent"
+            and coc_image_latent_reverse == "recompute_prev"
+            and depth is not None
+        )
+        if diffusion_process == "coc_image_latent" and coc_image_latent_reverse == "recompute_prev" and depth is None:
+            print("[CoC Image Latent]: depth is unavailable, falling back to scheduler.step reverse.")
+
+        def coc_image_latent_recompute_prev_step(model_output, timestep, sample):
+            pred_original_sample = predict_original_sample(model_output, timestep, sample)
+            prev_timestep_value = previous_timestep_from_schedule(timestep)
+            if prev_timestep_value < 0:
+                return pred_original_sample
+
+            prev_timestep_batch = torch.full(
+                (sample.shape[0],),
+                prev_timestep_value,
+                device=sample.device,
+                dtype=torch.long,
+            )
+            pred_image = decode_latents_to_image(pred_original_sample)
+            prev_coc_image = add_coc_blur(
+                pred_image,
+                depth,
+                prev_timestep_batch,
+                num_train_timesteps=self.scheduler.config.num_train_timesteps,
+                default_focus_depth=coc_focus_depth,
+                default_focus_width=coc_focus_width,
+                max_radius=coc_max_radius,
+                gamma=coc_gamma,
+                schedule_power=coc_schedule_power,
+                global_blur_at_max=coc_global_blur_at_max,
+                depth_blur_strength=coc_depth_blur_strength,
+                focus_depth_min=coc_focus_depth_min,
+                focus_depth_max=coc_focus_depth_max,
+                focus_width_min=coc_focus_width_min,
+                focus_width_max=coc_focus_width_max,
+                global_blur_min=coc_global_blur_min,
+                global_blur_max=coc_global_blur_max,
+                focus_depth=coc_sample_focus_depth,
+                focus_width=coc_sample_focus_width,
+                global_blur_floor=coc_sample_global_blur_floor,
+            )
+            prev_noise = normalize_coc_noise_latents(encode_image_to_latents(prev_coc_image))
+            alpha_prod_prev = alpha_prod_for_timestep(prev_timestep_value, sample)
+            return alpha_prod_prev.sqrt() * pred_original_sample + (1.0 - alpha_prod_prev).sqrt() * prev_noise
+
+        def coc_image_latent_source_endpoint_step(model_output, timestep, sample):
+            pred_original_sample = predict_original_sample(model_output, timestep, sample)
+            prev_timestep_value = previous_timestep_from_schedule(timestep)
+            if prev_timestep_value < 0:
+                return pred_original_sample
+
+            alpha_prod_prev = alpha_prod_for_timestep(prev_timestep_value, sample)
+            return (
+                alpha_prod_prev.sqrt() * pred_original_sample
+                + (1.0 - alpha_prod_prev).sqrt() * coc_image_latent_endpoint_latents
+            )
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -890,8 +1054,9 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
 
             for i, t in enumerate(timesteps):
                 # pass, if the timestep is larger than start_steps
-                if t > start_steps:
+                if int(t.item() if isinstance(t, torch.Tensor) else t) > start_steps:
                     print(f'pass {t} steps.')
+                    progress_bar.update()
                     continue
 
                 # expand the latents if we are doing classifier free guidance
@@ -1043,9 +1208,16 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                             contributors[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += tile_weights
                     # Average overlapping areas with more than 1 contributor
                     noise_pred /= contributors
-                if diffusion_process in ("gaussian", "coc_image_latent"):
+                if diffusion_process == "gaussian":
                     # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                elif diffusion_process == "coc_image_latent":
+                    if use_coc_image_latent_recompute:
+                        latents = coc_image_latent_recompute_prev_step(noise_pred, t, latents)
+                    elif coc_image_latent_reverse == "source_endpoint":
+                        latents = coc_image_latent_source_endpoint_step(noise_pred, t, latents)
+                    else:
+                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                 elif diffusion_process == "coc_blur":
                     if depth is not None:
                         latents = coc_blur_scheduler.step(

@@ -44,6 +44,27 @@ x_{t-1} = scheduler.step(epsilon_hat, t, x_t)
 
 注意：标准化只能匹配均值和方差，不能严格保证 CoC latent 成为独立高斯噪声；它是为了让结构化 CoC 噪声与 DDIM/DDPM scheduler 的数值尺度更兼容。
 
+也可以测试更贴近 CoC 前向轨迹的逆向过程，但它不是默认路径：
+
+```text
+epsilon_hat_t = model(x_t, t, source)
+z_0_hat = (x_t - sqrt(1 - alpha_t) * epsilon_hat_t) / sqrt(alpha_t)
+epsilon_hat_{t-1} = Normalize(VAE(CoCBlur(Decode(z_0_hat), depth, t-1)))
+x_{t-1} = sqrt(alpha_{t-1}) * z_0_hat + sqrt(1 - alpha_{t-1}) * epsilon_hat_{t-1}
+```
+
+该模式通过 `--coc_image_latent_reverse recompute_prev` 开启，需要测试时提供 depth；否则会自动退回官方 scheduler 逆向。当前 checkpoint 上该路径容易因为每步 `Decode -> CoCBlur -> Encode` 的闭环误差而塌缩，建议只作为诊断实验。
+
+新增一个更轻量的端点锚定逆向：
+
+```text
+epsilon_hat_t = model(x_t, t, source)
+z_0_hat = (x_t - sqrt(1 - alpha_t) * epsilon_hat_t) / sqrt(alpha_t)
+x_{t-1} = sqrt(alpha_{t-1}) * z_0_hat + sqrt(1 - alpha_{t-1}) * VAE(source)
+```
+
+该模式通过 `--coc_image_latent_reverse source_endpoint` 开启，不需要 depth。它把真实输入作为退化端点，比 `recompute_prev` 稳定，但高 timestep 仍会放大 `z_0_hat` 误差；可以配合 `START_STEPS` 从较低退化程度开始。
+
 ## 环境
 
 ```bash
@@ -164,9 +185,11 @@ bash scripts/test_seesr.sh
 脚本默认：
 - 模型路径: `/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_image_latent/checkpoint-5000`
 - 输入路径: `/home/gd09385/data/test_c/source`
-- 输出路径: `/home/gd09385/work/CoCDiffusion/experiment/deblur_test_coc_image_latent-5000-onestep`
+- 输出路径: `/home/gd09385/work/CoCDiffusion/experiment/deblur_test_coc_image_latent-lr-5000-1`
 - `DIFFUSION_PROCESS=coc_image_latent`
 - `NUM_INFERENCE_STEPS=1`
+- `COC_IMAGE_LATENT_REVERSE=scheduler`
+- `COC_IMAGE_LATENT_NORMALIZE_START=0`
 
 `coc_blur` / `coc_endpoint` 旧实验路径使用 depth 测试：
 
@@ -176,7 +199,39 @@ DEPTH_PATH=/home/gd09385/data/test_c/depth \
 bash scripts/test_coc.sh
 ```
 
-`coc_image_latent` 测试时不再需要 CoC scheduler；输入起点是 `VAE(source)`，反向采样使用 diffusers 官方 scheduler。
+`coc_image_latent` 默认测试时不需要 depth；输入起点是 raw `VAE(source)`，反向采样使用 diffusers 官方 scheduler。
+
+如果要测试显式重建 `t-1` CoC latent 的逆向过程：
+
+```bash
+USE_DEPTH=1 \
+DEPTH_PATH=/home/gd09385/data/test_c/depth \
+bash scripts/test_coc.sh --coc_image_latent_reverse recompute_prev
+```
+
+对照官方 scheduler 逆向：
+
+```bash
+bash scripts/test_coc.sh --coc_image_latent_reverse scheduler
+```
+
+测试端点锚定逆向，并从中等退化程度开始：
+
+```bash
+NUM_INFERENCE_STEPS=20 \
+START_STEPS=201 \
+COC_IMAGE_LATENT_REVERSE=source_endpoint \
+bash scripts/test_coc.sh
+```
+
+如果要强制一步从最大训练 timestep 开始，可使用 full-range 时间表：
+
+```bash
+NUM_INFERENCE_STEPS=1 \
+COC_IMAGE_LATENT_REVERSE=source_endpoint \
+COC_IMAGE_LATENT_TIMESTEP_SPACING=full_range \
+bash scripts/test_coc.sh
+```
 
 多步测试示例：
 
@@ -187,6 +242,56 @@ bash scripts/test_coc.sh
 ```
 
 推理保持原始分辨率。如果宽高不是 8 的倍数，只做最小边缘 padding，输出后裁回原尺寸。
+
+## DDIM Baseline
+
+如果只看原始 Gaussian DDIM/DDPM baseline，使用 `gaussian` 分支即可。训练前向过程为：
+
+```text
+z_0 = VAE(gt)
+epsilon ~ N(0, I)
+x_t = scheduler.add_noise(z_0, epsilon, t)
+loss = MSE(model(x_t, t, source), epsilon)
+```
+
+测试反向过程同步使用官方 scheduler：
+
+```text
+epsilon_hat = model(x_t, t, source)
+x_{t-1} = scheduler.step(epsilon_hat, t, x_t)
+```
+
+训练 baseline：
+
+```bash
+bash scripts/train_ddim.sh
+```
+
+默认训练设置：
+- `DIFFUSION_PROCESS=gaussian`
+- `TIMESTEP_CONDITIONING=on`
+- `ROOT_FOLDERS=/home/gd09385/data/train_c_sub`
+- 默认只训练 ControlNet；如需解冻 UNet，可设置 `UNET_TRAIN_PRESET`
+
+测试已有 baseline checkpoint：
+
+```bash
+bash scripts/test_ddim.sh
+```
+
+当前本地已有 checkpoint：
+- `/home/gd09385/work/CoCDiffusion/experiment/deblur_train_c_sub/checkpoint-36000`
+
+单图连通性测试：
+
+```bash
+IMAGE_PATH=/home/gd09385/data/test_c/source/1P0A0917.png \
+OUTPUT_DIR=/home/gd09385/work/CoCDiffusion/experiment/debug_ddim_baseline_one \
+NUM_INFERENCE_STEPS=20 \
+bash scripts/test_ddim.sh
+```
+
+说明：`/home/gd09385/data/test_c` 的 `source` 和 `target` 文件名不完全同名，不能直接用 `eval_seesr.py` 自动配对。按排序粗配第一张图时，输入约为 `25.25 dB / 0.662 SSIM`，baseline 输出约为 `23.00 dB / 0.557 SSIM`，主要用于判断趋势而非最终论文指标。
 
 ## 其他实验路径
 

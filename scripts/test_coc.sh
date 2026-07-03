@@ -8,10 +8,10 @@ set -u
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 PRETRAINED_MODEL_PATH="${PRETRAINED_MODEL_PATH:-/home/gd09385/models/stable-diffusion-2-base}"
-SEESR_MODEL_PATH="${SEESR_MODEL_PATH:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_image_latent/checkpoint-5000}"
+SEESR_MODEL_PATH="${SEESR_MODEL_PATH:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_coc_image_latent/checkpoint-15000}"
 IMAGE_PATH="${IMAGE_PATH:-/home/gd09385/data/test_c/source}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_test_coc_image_latent-5000-onestep}"
-NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-1}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_test_coc_image_latent-lr-15000-20}"
+NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-20}"
 SAMPLE_TIMES="${SAMPLE_TIMES:-1}"
 MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 CONDITIONING_SCALE="${CONDITIONING_SCALE:-1.0}"
@@ -30,10 +30,16 @@ COC_SCHEDULE_POWER="${COC_SCHEDULE_POWER:-3.0}"
 COC_GLOBAL_BLUR_AT_MAX="${COC_GLOBAL_BLUR_AT_MAX:-0.0}"
 COC_DEPTH_BLUR_STRENGTH="${COC_DEPTH_BLUR_STRENGTH:-1.0}"
 COC_INFERENCE_START="${COC_INFERENCE_START:-encoded_input}"
+COC_IMAGE_LATENT_REVERSE="${COC_IMAGE_LATENT_REVERSE:-scheduler}"
+COC_IMAGE_LATENT_TIMESTEP_SPACING="${COC_IMAGE_LATENT_TIMESTEP_SPACING:-scheduler}"
+COC_IMAGE_LATENT_NORMALIZE_START="${COC_IMAGE_LATENT_NORMALIZE_START:-0}"
+COC_NOISE_NORMALIZATION="${COC_NOISE_NORMALIZATION:-sample}"
+COC_NOISE_NORMALIZATION_EPS="${COC_NOISE_NORMALIZATION_EPS:-1e-6}"
 DIFFUSION_PROCESS="${DIFFUSION_PROCESS:-coc_image_latent}"
 USE_DEPTH="${USE_DEPTH:-}"
 START_BLUR_SIGMA="${START_BLUR_SIGMA:-8.0}"
 START_BLUR_KERNEL_SIZE="${START_BLUR_KERNEL_SIZE:-}"
+START_STEPS="${START_STEPS:-201}"
 UPDATE_BLEND="${UPDATE_BLEND:-1.0}"
 TIMESTEP_CONDITIONING="${TIMESTEP_CONDITIONING:-auto}"
 
@@ -64,10 +70,19 @@ cmd=(
   --coc_global_blur_at_max "${COC_GLOBAL_BLUR_AT_MAX}"
   --coc_depth_blur_strength "${COC_DEPTH_BLUR_STRENGTH}"
   --coc_inference_start "${COC_INFERENCE_START}"
+  --coc_image_latent_reverse "${COC_IMAGE_LATENT_REVERSE}"
+  --coc_image_latent_timestep_spacing "${COC_IMAGE_LATENT_TIMESTEP_SPACING}"
+  --coc_noise_normalization "${COC_NOISE_NORMALIZATION}"
+  --coc_noise_normalization_eps "${COC_NOISE_NORMALIZATION_EPS}"
   --start_blur_sigma "${START_BLUR_SIGMA}"
+  --start_steps "${START_STEPS}"
   --update_blend "${UPDATE_BLEND}"
   --timestep_conditioning "${TIMESTEP_CONDITIONING}"
 )
+
+if [[ "${COC_IMAGE_LATENT_NORMALIZE_START}" == "1" ]]; then
+  cmd+=(--coc_image_latent_normalize_start)
+fi
 
 if [[ -n "${USE_DEPTH}" ]]; then
   cmd+=(--use_depth)

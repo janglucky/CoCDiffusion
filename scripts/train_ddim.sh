@@ -13,12 +13,16 @@ ROOT_FOLDERS="${ROOT_FOLDERS:-/home/gd09385/data/train_c_sub}"
 OUTPUT_DIR="${OUTPUT_DIR:-/home/gd09385/work/CoCDiffusion/experiment/deblur_train_ddim}"
 MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
+UNET_LEARNING_RATE="${UNET_LEARNING_RATE:-1e-6}"
+UNET_TRAIN_PRESET="${UNET_TRAIN_PRESET:-none}"
+UNET_TRAINABLE_MODULES="${UNET_TRAINABLE_MODULES:-}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
-CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-1000}"
+CHECKPOINTING_STEPS="${CHECKPOINTING_STEPS:-5000}"
 MAX_TRAIN_STEPS="${MAX_TRAIN_STEPS:-}"
-RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-}"
+RESUME_FROM_CHECKPOINT="${RESUME_FROM_CHECKPOINT:-latest}"
+TIMESTEP_CONDITIONING="${TIMESTEP_CONDITIONING:-off}"
 
 cmd=(
   accelerate launch train_seesr.py
@@ -30,13 +34,20 @@ cmd=(
   --enable_xformers_memory_efficient_attention
   --mixed_precision "${MIXED_PRECISION}"
   --learning_rate "${LEARNING_RATE}"
+  --unet_learning_rate "${UNET_LEARNING_RATE}"
+  --unet_train_preset "${UNET_TRAIN_PRESET}"
   --train_batch_size "${TRAIN_BATCH_SIZE}"
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}"
   --checkpointing_steps "${CHECKPOINTING_STEPS}"
   --diffusion_process gaussian
-  --timestep_conditioning on
+  --timestep_conditioning "${TIMESTEP_CONDITIONING}"
 )
+
+if [[ -n "${UNET_TRAINABLE_MODULES}" ]]; then
+  read -r -a UNET_TRAINABLE_MODULE_ARRAY <<< "${UNET_TRAINABLE_MODULES}"
+  cmd+=(--unet_trainable_modules "${UNET_TRAINABLE_MODULE_ARRAY[@]}")
+fi
 
 if [[ -n "${RESUME_FROM_CHECKPOINT}" ]]; then
   cmd+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
