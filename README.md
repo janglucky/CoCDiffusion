@@ -20,6 +20,7 @@
 ```text
 z_0 = VAE(gt)
 epsilon_coc,t = VAE(CoCBlur(gt, depth, t))
+epsilon_coc,t = Normalize(epsilon_coc,t)
 x_t = scheduler.add_noise(z_0, epsilon_coc,t, t)
 ```
 
@@ -30,6 +31,7 @@ x_t = scheduler.add_noise(z_0, epsilon_coc,t, t)
 - `x_t` 是 latent-space 扩散状态
 - `scheduler.add_noise` 使用 diffusers 官方 scheduler 的 `alpha_prod_t`
 - CoC 模糊强度仍由 `blur_scale_t = (t / (T - 1)) ^ schedule_power` 控制
+- `Normalize` 默认对每个样本的 latent 做零均值、单位方差标准化，使 CoC 噪声 latent 的尺度更接近 `N(0, I)`
 
 网络输出对齐标准 DDIM/DDPM 的噪声估计语义：在 `coc_image_latent` 中不预测 clean latent，而是预测当前 timestep 的 CoC 模糊 latent `epsilon_coc,t`。反向过程直接沿用官方 scheduler：
 
@@ -39,6 +41,8 @@ x_{t-1} = scheduler.step(epsilon_hat, t, x_t)
 ```
 
 这样 CoC 只负责生成图像域模糊，扩散混合和反向采样全部交给 diffusers 官方 scheduler。
+
+注意：标准化只能匹配均值和方差，不能严格保证 CoC latent 成为独立高斯噪声；它是为了让结构化 CoC 噪声与 DDIM/DDPM scheduler 的数值尺度更兼容。
 
 ## 环境
 
@@ -133,8 +137,9 @@ bash scripts/train_coc.sh
 - `UNET_TRAIN_PRESET=controlnet_interaction_full`
 - `CHECKPOINTING_STEPS=5000`
 - `TIMESTEP_CONDITIONING=auto`，对 `coc_image_latent` 默认开启 timestep embedding
+- `COC_NOISE_NORMALIZATION=sample`，对 CoC blur latent 做每样本零均值/单位方差标准化
 
-当前训练损失只包含 latent MSE；`coc_image_latent` 的目标是图像域 CoC blur 后再编码得到的 `epsilon_coc,t`：
+当前训练损失只包含 latent MSE；`coc_image_latent` 的目标是图像域 CoC blur 后再编码并标准化得到的 `epsilon_coc,t`：
 
 ```text
 loss = MSE(model_pred, epsilon_coc,t)

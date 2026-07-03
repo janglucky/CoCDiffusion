@@ -483,6 +483,22 @@ def parse_args(input_args=None):
         help="Strength of depth-dependent radius variation before the global blur floor is applied.",
     )
     parser.add_argument(
+        "--coc_noise_normalization",
+        type=str,
+        choices=["none", "sample"],
+        default="sample",
+        help=(
+            "Normalize the CoC blur latent before using it as scheduler noise. "
+            "`sample` standardizes each latent sample over C/H/W"
+        ),
+    )
+    parser.add_argument(
+        "--coc_noise_normalization_eps",
+        type=float,
+        default=1e-6,
+        help="Numerical epsilon used by CoC latent noise normalization.",
+    )
+    parser.add_argument(
         "--timestep_conditioning",
         type=str,
         choices=["auto", "on", "off"],
@@ -513,6 +529,17 @@ def resolve_timestep_conditioning(args):
     if args.timestep_conditioning == "off":
         return False
     return args.diffusion_process in ("gaussian", "coc_image_latent")
+
+
+def normalize_coc_noise_latents(noise, mode="sample", eps=1e-6):
+    if mode == "none":
+        return noise
+
+    noise_float = noise.float()
+    mean = noise_float.mean(dim=(1, 2, 3), keepdim=True)
+    variance = (noise_float - mean).pow(2).mean(dim=(1, 2, 3), keepdim=True)
+    normalized = (noise_float - mean) * torch.rsqrt(variance + float(eps))
+    return normalized.to(dtype=noise.dtype)
 
 
 UNET_TRAIN_PRESETS = {
@@ -1007,6 +1034,8 @@ for epoch in range(first_epoch, args.num_train_epochs):
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
             timesteps = timesteps.long()
             noise = None
+            coc_noise_mean = None
+            coc_noise_std = None
 
             if args.diffusion_process == "gaussian":
                 # Original forward diffusion process.
@@ -1056,6 +1085,13 @@ for epoch in range(first_epoch, args.num_train_epochs):
                         global_blur_max=args.coc_global_blur_max,
                     )
                     noise = encode_image_to_latents(coc_blurred_image)
+                    noise = normalize_coc_noise_latents(
+                        noise,
+                        mode=args.coc_noise_normalization,
+                        eps=args.coc_noise_normalization_eps,
+                    )
+                    coc_noise_mean = noise.detach().float().mean()
+                    coc_noise_std = noise.detach().float().std(unbiased=False)
                 model_input_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             else:
                 degraded_endpoint_latents = vae.encode(controlnet_image * 2.0 - 1.0).latent_dist.sample()
@@ -1128,6 +1164,9 @@ for epoch in range(first_epoch, args.num_train_epochs):
             "latent_loss_weighted": latent_loss_value,
             "lr": last_lrs[0],
         }
+        if coc_noise_mean is not None and coc_noise_std is not None:
+            logs["coc_noise_mean"] = coc_noise_mean.item()
+            logs["coc_noise_std"] = coc_noise_std.item()
         if len(last_lrs) > 1:
             logs["unet_lr"] = last_lrs[1]
         progress_bar.set_postfix(
